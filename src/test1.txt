@@ -1,0 +1,83 @@
+
+#include <SPI.h>
+#include <GxEPD2_BW.h>
+#include <GxEPD2.h>
+#include <Fonts/FreeMonoBold12pt7b.h>
+#include <Arduino.h>
+
+// Pin definitions
+#define CS_PIN 5
+#define DC_PIN 17
+#define RST_PIN 16
+#define BUSY_PIN 4
+
+/*
+MAKE SURE YOU ARE USING THE APPROPRIATE DISPLAY
+either: https://www.waveshare.com/product/displays/e-paper/epaper-2/4.2inch-e-paper-module.htm
+or: https://www.waveshare.com/2.9inch-e-Paper-Module.htm
+
+It must be a V2 || rev2.1 e-paper module or raw display
+*/
+
+// IF YOU ARE USING THE LARGER 4INCH DISPLAY YOU WILL NEED TO USE GxEPD2_420_GDEY042T81 instead of GxEPD2_290_BS on the next line
+GxEPD2_BW<GxEPD2_290_BS, GxEPD2_290_BS::HEIGHT> display(GxEPD2_290_BS(/*CS=D8*/ SS, /*DC=D3*/ DC_PIN, /*RST=D4*/ RST_PIN, /*BUSY=D2*/ BUSY_PIN)); // DEPG0290BS 128x296, SSD1680
+
+void writeTestText() {
+  Serial.println("Set partial");
+  display.setPartialWindow(0, 0, display.width(), 296); //this sets a window for the partial update, so the values can update without refreshing the entire screen.
+  
+  Serial.println("first page");
+  display.firstPage();
+  do {
+    display.setCursor(0, 15);  // Set the cursor position
+    display.setTextColor(GxEPD_BLACK);  // Set the text color
+	  display.setFont(&FreeMonoBold12pt7b); // set the font you want to use
+	  display.setTextSize(1); // set a font size
+    Serial.println("print");
+    display.print("Test: ");  // Print text
+    display.print(millis());
+    Serial.println("display");
+    display.display(); // make sure you call display after you update the screen content
+  } while (display.nextPage());
+}
+
+void writeText(const char* inputText, int xPos, int yPos) {
+  Serial.print("Writing text: ");
+  Serial.println(inputText);
+
+  display.setPartialWindow(0, 0, display.width(), 296); //this sets a window for the partial update, so the values can update without refreshing the entire screen.
+  display.setTextColor(GxEPD_BLACK);  // Set the text color
+  display.setFont(&FreeMonoBold12pt7b); // set the font you want to use
+  display.setTextSize(1); // set a font size
+
+  display.firstPage();
+  do {
+    display.setCursor(xPos, yPos);  // Set the cursor position
+    display.print(inputText);  // Print text
+    display.display(); // make sure you call display after you update the screen content
+  } while (display.nextPage());
+}
+
+void setupDisplay(bool useBlackBackgroundWhiteText = false, int16_t cs = SS, int16_t dc = DC_PIN, int16_t rst = RST_PIN, int16_t busy = BUSY, uint32_t baud = 115200, uint8_t rotation = 3) 
+{
+  Serial.println("Setting up display");
+  display.init(baud);  // Initialize the display with a baud rate
+  display.setRotation(rotation);
+  Serial.println("Setting full window");
+  display.fillScreen(GxEPD_WHITE);
+}
+
+void setup() {
+  Serial.begin(115200);
+	setupDisplay(); // run the function that initializes the display.
+}
+
+void loop() {
+  Serial.println("fill");
+  display.fillScreen(GxEPD_WHITE);
+  Serial.println("start test");
+  writeTestText();
+  Serial.println("finish and delay");
+  delay(1000);
+
+}

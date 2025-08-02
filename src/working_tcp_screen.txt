@@ -1,0 +1,217 @@
+#define ENABLE_GxEPD2_GFX 0
+#include <GxEPD2_BW.h>
+#include <U8g2_for_Adafruit_GFX.h>
+#include <WiFi.h>
+
+#define CS_PIN 5
+#define DC_PIN 17
+#define RST_PIN 16
+#define BUSY_PIN 4
+
+#define MAX_DISPLAY_BUFFER_SIZE 800 
+#define MAX_HEIGHT(EPD) (EPD::HEIGHT <= MAX_DISPLAY_BUFFER_SIZE / (EPD::WIDTH / 8) ? EPD::HEIGHT : MAX_DISPLAY_BUFFER_SIZE / (EPD::WIDTH / 8))
+GxEPD2_BW<GxEPD2_290_BS, GxEPD2_290_BS::HEIGHT> display(GxEPD2_290_BS(/*CS=D8*/ SS, /*DC=D3*/ DC_PIN, /*RST=D4*/ RST_PIN, /*BUSY=D2*/ BUSY_PIN)); // DEPG0290BS 128x296, SSD1680
+uint16_t bg = GxEPD_WHITE;
+uint16_t fg = GxEPD_BLACK;
+U8G2_FOR_ADAFRUIT_GFX u8g2Fonts;
+
+const char* ssid = "DraconE";
+const char* password = "Rarceth1996!";
+
+IPAddress static_ip(192,168,4,51);
+IPAddress dns(192,168,4,1);
+IPAddress gateway(192,168,4,1);
+IPAddress subnet(255, 255, 255, 0);
+
+int port = 8888;  //Port number
+WiFiServer server(port);
+
+void displayValues();
+void displayText0(const char* inputText);
+void displayServerState();
+void setDisplayStandard();
+void debug_network();
+
+void setup()
+{
+  Serial.begin(115200);
+  display.init();
+  u8g2Fonts.begin(display); // connect u8g2 procedures to Adafruit GFX
+  delay(1000);
+
+  displayText0("Connecting...");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.config(static_ip, gateway, subnet, dns);
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(100);
+  }
+
+  delay(200);
+  displayText0("Connected!");
+  delay(200);
+
+  //displayText0(WiFi.localIP().toString().c_str());
+  displayServerState();
+  debug_network();
+
+  server.begin(port);
+}
+
+bool hasClient = false;
+bool alreadyConnected = false;
+const char* lastMessage = "";
+
+void loop()
+{
+  WiFiClient client = server.available();
+  if (client) {
+    if (client.connected())
+    {
+      if (!alreadyConnected)
+      {
+        Serial.println("New client connected");
+        client.flush();
+        alreadyConnected = true;
+      }
+    }
+
+    hasClient = true;
+
+    displayServerState();
+
+    while (client.connected())
+    {
+      int length = client.available();
+      if (client.available() > 0)
+      {
+        String incoming = client.readStringUntil('\n');
+        lastMessage = incoming.c_str();
+        Serial.print("Data received: ");
+        Serial.print(lastMessage);
+        Serial.println();
+        displayServerState();
+      }
+      /*
+      while (client.available() > 0)
+      {
+        Serial.write(client.read());
+      }
+      while (Serial.available() > 0)
+      {
+        client.write(Serial.read());
+      }
+        */
+    }
+    client.stop();
+    Serial.println("Client disconnected");
+    hasClient = false;
+    displayServerState();
+  }
+  //displayValues();
+  delay(100);  
+}
+
+void setDisplayStandard() {
+  display.setRotation(1); // 0--> No rotation ,  1--> rotate 90 deg
+  u8g2Fonts.setFontMode(1);                 // use u8g2 transparent mode (this is default)
+  u8g2Fonts.setFontDirection(0);            // left to right (this is default)
+  u8g2Fonts.setForegroundColor(fg);         // apply Adafruit GFX color
+  u8g2Fonts.setBackgroundColor(bg);         // apply Adafruit GFX color
+}
+
+void displayText0(const char* inputText) {
+  display.fillScreen(GxEPD_WHITE);
+  setDisplayStandard();
+  u8g2Fonts.setFont(u8g2_font_logisoso32_tr); //u8g2_font_logisoso32_tn--->numbers only to save memory ; u8g2_font_logisoso32_tr , u8g2_font_logisoso32_tf -->numbers&letters
+  uint16_t x = 165;
+  uint16_t y = 75;
+  display.setPartialWindow(0, 0, display.width(), 296); //this sets a window for the partial update, so the values can update without refreshing the entire screen.
+  display.firstPage();
+  do
+  {
+    display.fillScreen(bg);
+
+    u8g2Fonts.setCursor(10, y); 
+    u8g2Fonts.print(inputText);
+  }
+  while (display.nextPage());
+}
+
+void displayServerState() {
+  display.fillScreen(GxEPD_WHITE);
+  setDisplayStandard();
+  u8g2Fonts.setFont(u8g2_font_t0_16_tf);
+  uint16_t x = 40;
+  uint16_t y = 25;
+  display.setPartialWindow(0, 0, display.width(), 296); //this sets a window for the partial update, so the values can update without refreshing the entire screen.
+  display.firstPage();
+  do
+  {
+    display.fillScreen(bg);
+
+    u8g2Fonts.setCursor(x, y); 
+    u8g2Fonts.print("IP:");
+    u8g2Fonts.setCursor(x + 100, y); 
+    u8g2Fonts.print(WiFi.localIP().toString().c_str());
+
+    u8g2Fonts.setCursor(x, y + 25);
+    u8g2Fonts.print("Connected:");
+    u8g2Fonts.setCursor(x + 100, y + 25);
+    u8g2Fonts.print(hasClient ? "True" : "False");
+
+    u8g2Fonts.setCursor(x, y + 75);
+    u8g2Fonts.print("Last:");
+    u8g2Fonts.setCursor(x + 100, y + 75);
+    u8g2Fonts.print(lastMessage);
+
+  }
+  while (display.nextPage());
+}
+
+void displayValues()
+{
+  display.fillScreen(GxEPD_WHITE);
+
+  int number; //A0 Value
+  number = millis() / 1000;  
+
+  setDisplayStandard();
+  //u8g2Fonts.setFont(u8g2_font_helvR14_tf);  // select u8g2 font from here:  https://github.com/olikraus/u8g2/wiki/fntlistall
+  
+  //u8g2Fonts.setFont(u8g2_font_logisoso32_tr); //u8g2_font_logisoso32_tn--->numbers only to save memory ; u8g2_font_logisoso32_tr , u8g2_font_logisoso32_tf -->numbers&letters
+  u8g2Fonts.setFont(u8g2_font_t0_16_tf);
+  uint16_t x = 165;
+  uint16_t y = 75;
+  display.setPartialWindow(0, 0, display.width(), 296); //this sets a window for the partial update, so the values can update without refreshing the entire screen.
+  display.firstPage();
+  do
+  {
+    display.fillScreen(bg);
+
+    u8g2Fonts.setCursor(10, y); 
+    u8g2Fonts.print("Runtime:");
+    u8g2Fonts.setCursor(x, y);
+    u8g2Fonts.println(number, 1);
+  }
+  while (display.nextPage());
+}
+
+void debug_network(){
+  if(WiFi.status() == WL_CONNECTED) {
+      Serial.print("[*] Network information for ");
+      Serial.println(ssid);
+
+      Serial.println("[+] BSSID : " + WiFi.BSSIDstr());
+      Serial.print("[+] Gateway IP : ");
+      Serial.println(WiFi.gatewayIP());
+      Serial.print("[+] Subnet Mask : ");
+      Serial.println(WiFi.subnetMask());
+      Serial.println((String)"[+] RSSI : " + WiFi.RSSI() + " dB");
+      Serial.print("[+] ESP32 IP : ");
+      Serial.println(WiFi.localIP());
+  }
+}
