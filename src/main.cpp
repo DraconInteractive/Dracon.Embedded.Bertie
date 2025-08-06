@@ -4,12 +4,15 @@
 #include <WiFi.h>
 #include <map>
 #include <Servo.h>
+#include <vector>
 
 #define SERVO_BASE_PIN 25
 #define SERVO_LINK_1_PIN 26
 
-#define SLIDE_PIN 33
+#define SLIDE_PIN 0 // TODO SET PIN
 #define ROT_PIN 0 // TODO SET PIN
+#define MIC_PIN 34
+#define BTN_PIN 39
 
 #define CS_PIN 5
 #define DC_PIN 17
@@ -47,6 +50,10 @@ Servo linkOneServo;
 int baseServoC;
 int linkOneServoC;
 
+bool readingMic = false;
+int micDelay = 20;
+std::vector<int> micBuffer;
+
 // Notes
 
 // Wiring: 
@@ -59,23 +66,34 @@ int linkOneServoC;
 // eink y18 o5 g17 w16 p4 b23
 // y->p are in order, b23 is the outlier at the far end
 
-void displayEyes(int emote);
-void displayEyesSymbol(const char* symbol);
-void displayValues();
-void displayText0(const char* inputText);
-void displayServerState();
+void displayEyes(int emote, bool refreshScreen = false);
+void displayEyesSymbol(const char* symbol, bool refreshScreen = false);
+//void displayValues();
+void displayText0(const char* inputText, bool refreshScreen = false);
+void displayServerState(bool displayOnScreen = false, bool refreshScreen = false);
+void displayTextAdv(const char* inputText, int fontSize = 4, uint16_t color = GxEPD_WHITE, int cX = 120, int cY = 80, bool refreshScreen = false);
 void setDisplayStandard();
 void scheduleInterval();
 void debug_network();
-void blinkEvent();
+void blinkEvent(bool refreshScreen = false);
 void servoTest();
 void servoReset();
+void setBaseServo (int angle);
+void setLinkOneServo (int angle);
 float inverseLerp(float a, float b, float x);
 float lerp(float start_val, float end_val, float fraction);
+void g_base();
+void g_yes();
+void g_no();
+void g_search();
+void parseLastMessage();
 
 void setup()
 {
   Serial.begin(115200);
+
+  analogSetAttenuation(ADC_11db);
+  micBuffer.reserve(1024);
 
   randomSeed(analogRead(0));
 
@@ -87,10 +105,10 @@ void setup()
   baseServo.attach(SERVO_BASE_PIN);
   linkOneServo.attach(SERVO_LINK_1_PIN);
 
-  pinMode(SLIDE_PIN, INPUT);
+  //pinMode(SLIDE_PIN, INPUT);
   //pinMode(ROT_PIN, INPUT);
 
-  displayEyesSymbol("...");
+  displayEyesSymbol("|", true);
 
   WiFi.mode(WIFI_STA);
   WiFi.config(static_ip, gateway, subnet, dns);
@@ -101,9 +119,14 @@ void setup()
     delay(100);
   }
 
+  g_base();
   delay(200);
   displayEyes(7);
   delay(200);
+  displayEyes(0);
+
+  Serial.print("W: "); Serial.println(display.width());
+  Serial.print("H: "); Serial.println(display.height());
 
   displayServerState();
   debug_network();
@@ -115,6 +138,35 @@ void setup()
 
 void loop()
 {
+  bool btnValue = analogRead(BTN_PIN) < 1000; // use proper threshold
+  bool uploadMicFlag = false;
+  if (btnValue && !readingMic)
+  {
+    Serial.println("Button pressed");
+    readingMic = true;
+    micBuffer.clear();
+  } else if (!btnValue && readingMic)
+  {
+    Serial.println("Button released");
+    readingMic = false;
+    uploadMicFlag = true;
+
+    for (int i = 0; i < micBuffer.size(); i++)
+    {
+      Serial.println(micBuffer[i]);
+    }
+  }
+  
+  if (readingMic)
+  {
+    int m = analogRead(MIC_PIN);
+    int barLength = map(m, 0, 4095, 0, 20);  // Adjust for ESP32's 12-bit ADC
+    
+    micBuffer.push_back(barLength);
+    delay(micDelay);
+  }
+
+  return;
   WiFiClient client = server.available();
   if (client) {
     if (client.connected())
@@ -140,32 +192,19 @@ void loop()
         String incoming = client.readStringUntil('\n');
         incoming.trim();
         lastMessage = incoming;
+
         Serial.println("---");
         Serial.print("Data received: ");
         Serial.print(lastMessage);
         Serial.println();
+
         displayServerState();
-        displayEyesSymbol("!");
+
+        displayEyesSymbol("!", true);
         delay(500);
         
-        if (lastMessage == "test")
-        {
-          displayEyesSymbol(">");
-          delay(500);
-        }
-        else if (lastMessage == "servo")
-        {
-          servoTest();
-          delay(100);
-        }
-        else if (lastMessage == "servoreset")
-        {
-          servoReset();
-        }
-        else {
-          displayEyesSymbol("?");
-          delay(500);
-        }
+        parseLastMessage();
+
         displayEyes(0);
 
         scheduleInterval();
@@ -176,7 +215,6 @@ void loop()
     hasClient = false;
     displayServerState();
   }
-  //displayValues();
 
   /*
   if (millis() - lastEventTime > nextInterval)
@@ -186,6 +224,7 @@ void loop()
   }
   */
 
+  /*
   int d = analogRead(SLIDE_PIN);
   float n = inverseLerp(0, 4095, d); // map slide to float
   int m = (int)lerp(0, 180, n); // map float to angle
@@ -197,16 +236,20 @@ void loop()
     baseServo.write(m);
     baseServoC = m;
   }
+  */
 
   delay(100);  
 }
 
-void displayEyes(int emote) {
-  display.setRotation(1);
+void displayEyes(int emote, bool refreshScreen) {
+  display.setRotation(3);
   display.setPartialWindow(0, 0, display.width(), display.height());
   display.firstPage();
   do {
-    display.fillScreen(GxEPD_WHITE);
+    if (refreshScreen)
+    {
+      display.fillScreen(bg);
+    }
 
     // Draw left eye
     display.fillCircle(90, 60, 35, GxEPD_BLACK);
@@ -224,30 +267,38 @@ void displayEyes(int emote) {
       case 2: // Wide
         display.fillCircle(90, 65, 14, GxEPD_WHITE);
         display.fillCircle(210, 65, 14, GxEPD_WHITE);
-        break;;
+        Serial.println("Showing wide");
+        break;
       case 6: // Happy
         display.fillCircle(90, 65, 14, GxEPD_WHITE);
         display.fillCircle(210, 65, 14, GxEPD_WHITE);
         display.fillCircle(90, 75, 14, GxEPD_BLACK);
         display.fillCircle(210, 75, 14, GxEPD_BLACK);
+        Serial.println("Showing happy");
+        break;
       case 7: // Sad
         display.fillCircle(90, 65, 14, GxEPD_WHITE);
         display.fillCircle(210, 65, 14, GxEPD_WHITE);
         display.fillCircle(90, 55, 14, GxEPD_BLACK);
         display.fillCircle(210, 55, 14, GxEPD_BLACK);
+        Serial.println("Showing sad");
+        break;
     }
     
 
   } while (display.nextPage());
 }
 
-void displayEyesSymbol(const char* symbol)
+void displayEyesSymbol(const char* symbol, bool refreshScreen)
 {
-  display.setRotation(1);
+  display.setRotation(3);
   display.setPartialWindow(0, 0, display.width(), display.height());
   display.firstPage();
   do {
-    display.fillScreen(GxEPD_WHITE);
+    if (refreshScreen)
+    {
+      display.fillScreen(bg);
+    }
 
     // Draw left eye
     display.fillCircle(90, 60, 35, GxEPD_BLACK);
@@ -267,15 +318,14 @@ void displayEyesSymbol(const char* symbol)
 }
 
 void setDisplayStandard() {
-  display.setRotation(1); // 0--> No rotation ,  1--> rotate 90 deg
+  display.setRotation(3); // 0--> No rotation ,  1--> rotate 90 deg
   u8g2Fonts.setFontMode(1);                 // use u8g2 transparent mode (this is default)
   u8g2Fonts.setFontDirection(0);            // left to right (this is default)
   u8g2Fonts.setForegroundColor(fg);         // apply Adafruit GFX color
   u8g2Fonts.setBackgroundColor(bg);         // apply Adafruit GFX color
 }
 
-void displayText0(const char* inputText) {
-  display.fillScreen(GxEPD_WHITE);
+void displayText0(const char* inputText, bool refreshScreen) {
   setDisplayStandard();
   u8g2Fonts.setFont(u8g2_font_logisoso32_tr); //u8g2_font_logisoso32_tn--->numbers only to save memory ; u8g2_font_logisoso32_tr , u8g2_font_logisoso32_tf -->numbers&letters
   uint16_t x = 165;
@@ -284,7 +334,10 @@ void displayText0(const char* inputText) {
   display.firstPage();
   do
   {
-    display.fillScreen(bg);
+    if (refreshScreen)
+    {
+      display.fillScreen(bg);
+    }
 
     u8g2Fonts.setCursor(10, y); 
     u8g2Fonts.print(inputText);
@@ -292,7 +345,26 @@ void displayText0(const char* inputText) {
   while (display.nextPage());
 }
 
-void displayServerState() {
+void displayTextAdv(const char* inputText, int fontSize, uint16_t color, int cX, int cY, bool refreshScreen)
+{
+  display.setRotation(3);
+  display.setPartialWindow(0, 0, display.width(), display.height());
+  display.firstPage();
+  do {
+    if (refreshScreen)
+    {
+      display.fillScreen(bg);
+    }
+
+    display.setTextColor(color); 
+    display.setTextSize(fontSize);            
+    display.setCursor(cX, cY);         
+    display.print(inputText);                 
+
+  } while (display.nextPage());
+}
+
+void displayServerState(bool displayOnScreen, bool refreshScreen) {
   Serial.println("---");
   Serial.println("Server State");
   Serial.print("IP: ");
@@ -302,10 +374,11 @@ void displayServerState() {
   Serial.print("Last: ");
   Serial.println(lastMessage);
 
-  return; // TEMP
-
-  display.fillScreen(GxEPD_WHITE);
-  setDisplayStandard();
+  if (!displayOnScreen)
+  {
+    return;
+  }
+  
   u8g2Fonts.setFont(u8g2_font_t0_16_tf);
   uint16_t x = 40;
   uint16_t y = 25;
@@ -313,8 +386,11 @@ void displayServerState() {
   display.firstPage();
   do
   {
-    display.fillScreen(bg);
-
+    if (refreshScreen)
+    {
+      display.fillScreen(bg);
+    }
+    
     u8g2Fonts.setCursor(x, y); 
     u8g2Fonts.print("IP:");
     u8g2Fonts.setCursor(x + 100, y); 
@@ -330,34 +406,6 @@ void displayServerState() {
     u8g2Fonts.setCursor(x + 100, y + 75);
     u8g2Fonts.print(lastMessage);
 
-  }
-  while (display.nextPage());
-}
-
-void displayValues()
-{
-  display.fillScreen(GxEPD_WHITE);
-
-  int number; //A0 Value
-  number = millis() / 1000;  
-
-  setDisplayStandard();
-  //u8g2Fonts.setFont(u8g2_font_helvR14_tf);  // select u8g2 font from here:  https://github.com/olikraus/u8g2/wiki/fntlistall
-  
-  //u8g2Fonts.setFont(u8g2_font_logisoso32_tr); //u8g2_font_logisoso32_tn--->numbers only to save memory ; u8g2_font_logisoso32_tr , u8g2_font_logisoso32_tf -->numbers&letters
-  u8g2Fonts.setFont(u8g2_font_t0_16_tf);
-  uint16_t x = 165;
-  uint16_t y = 75;
-  display.setPartialWindow(0, 0, display.width(), 296); //this sets a window for the partial update, so the values can update without refreshing the entire screen.
-  display.firstPage();
-  do
-  {
-    display.fillScreen(bg);
-
-    u8g2Fonts.setCursor(10, y); 
-    u8g2Fonts.print("Runtime:");
-    u8g2Fonts.setCursor(x, y);
-    u8g2Fonts.println(number, 1);
   }
   while (display.nextPage());
 }
@@ -388,10 +436,8 @@ void blinkEvent() {
 void servoTest() {
   displayEyesSymbol("8");
   for(int angle = 0; angle <= 180; angle++) {
-    baseServo.write(angle);
-    linkOneServo.write(angle);
-    baseServoC = angle;
-    linkOneServoC = angle;
+    setBaseServo(angle);
+    setLinkOneServo(angle);
     delay(15); // Small delay for smoother movement
   }
 
@@ -399,10 +445,8 @@ void servoTest() {
 
   // Rotate all servos back from 180 to 0 degrees
   for(int angle = 180; angle >= 0; angle--) {
-    baseServo.write(angle);
-    linkOneServo.write(angle);
-    baseServoC = angle;
-    linkOneServoC = angle;
+    setBaseServo(angle);
+    setLinkOneServo(angle);
     delay(15); // Small delay for smoother movement
   }
 
@@ -410,10 +454,133 @@ void servoTest() {
 }
 
 void servoReset() {
-  baseServo.write(90);
-  linkOneServo.write(90);
-  baseServoC = 90;
-  linkOneServoC = 90;
+  setBaseServo(90);
+  setLinkOneServo(90);
+}
+
+void setBaseServo (int angle) {
+  angle = max(0, angle);
+  angle = min(angle, 180);
+  baseServo.write(angle);
+  baseServoC = angle;
+}
+
+void setLinkOneServo (int angle) {
+  angle = max(0, angle);
+  angle = min(angle, 180);
+  linkOneServo.write(angle);
+  linkOneServoC = angle;
+}
+
+void parseLastMessage() {
+    if (lastMessage == "dbi") // debug eyes
+    {
+      displayEyesSymbol(">", true);
+      delay(500);
+    }
+    else if (lastMessage == "dbsrange") // do full range servo test
+    {
+      servoTest();
+      delay(100);
+    }
+    else if (lastMessage == "rsts") // reset servo
+    {
+      servoReset();
+    }
+    else if (lastMessage == "dbcon") // debug connection
+    {
+      displayServerState(true, true);
+      delay(100);
+    }
+    else if (lastMessage == "dbtxt") // debug sub text
+    {
+      const char* txt = "Hello!";
+      displayTextAdv(txt, 2, GxEPD_BLACK, 128 - (strlen(txt) * 5), 90, true);
+      delay(1000);
+      const char* txt2 = "Hello friend!";
+      displayTextAdv(txt2, 2, GxEPD_BLACK, 128 - (strlen(txt2) * 5), 90, true);
+      delay(1000);
+      const char* txt3 = "Hello friend! Welcome!";
+      displayTextAdv(txt3, 2, GxEPD_BLACK, 128 - (strlen(txt3) * 5), 90, true);
+      delay(1000);
+    }
+    else if (lastMessage == "nod")
+    {
+      g_yes();
+    }
+    else if (lastMessage == "shake")
+    {
+      g_no();
+    }
+    else if (lastMessage == "search")
+    {
+      g_search();
+    }
+    else {
+      displayEyesSymbol("?");
+      delay(500);
+    }
+}
+
+void g_base() {
+  displayEyes(0);
+  setBaseServo(90);
+  setLinkOneServo(110);
+}
+
+void g_yes() {
+  displayEyes(6, true);
+  delay(200);
+  setLinkOneServo(linkOneServoC - 25);
+  delay(300);
+  setLinkOneServo(linkOneServoC + 50);
+  delay(300);
+  setLinkOneServo(linkOneServoC - 50);
+  delay(300);
+  setLinkOneServo(linkOneServoC + 50);
+  delay(300);
+  setLinkOneServo(linkOneServoC - 25);
+  displayEyes(0, true);
+}
+
+void g_no() {
+  displayEyes(7, true);
+  delay(200);
+  setBaseServo(baseServoC - 25);
+  delay(300);
+  setBaseServo(baseServoC + 50);
+  delay(300);
+  setBaseServo(baseServoC - 50);
+  delay(300);
+  setBaseServo(baseServoC + 50);
+  delay(300);
+  setBaseServo(baseServoC - 25);
+  displayEyes(0, true);
+}
+
+void g_search() {
+  displayEyesSymbol("?", true);
+  delay(200);
+  setBaseServo(90);
+  setLinkOneServo(90);
+  for (int i = 90; i > 60; i -= 5)
+  {
+    setLinkOneServo(i);
+    delay(100);
+  }
+  for (int i = 90; i < 140; i += 5) {
+    setBaseServo(i);
+    delay(100);
+  }
+  for (int i = 140; i > 50; i -= 5) {
+    setBaseServo(i);
+    delay(100);
+  }
+  delay(300);
+  setBaseServo(90);
+  delay(100);
+  g_base();
+  displayEyes(0, true);
 }
 
 float inverseLerp(float a, float b, float x) {
@@ -442,3 +609,34 @@ void debug_network(){
       Serial.println(WiFi.localIP());
   }
 }
+
+
+/*
+void displayValues()
+{
+  display.fillScreen(GxEPD_WHITE);
+
+  int number; //A0 Value
+  number = millis() / 1000;  
+
+  setDisplayStandard();
+  //u8g2Fonts.setFont(u8g2_font_helvR14_tf);  // select u8g2 font from here:  https://github.com/olikraus/u8g2/wiki/fntlistall
+  
+  //u8g2Fonts.setFont(u8g2_font_logisoso32_tr); //u8g2_font_logisoso32_tn--->numbers only to save memory ; u8g2_font_logisoso32_tr , u8g2_font_logisoso32_tf -->numbers&letters
+  u8g2Fonts.setFont(u8g2_font_t0_16_tf);
+  uint16_t x = 165;
+  uint16_t y = 75;
+  display.setPartialWindow(0, 0, display.width(), 296); //this sets a window for the partial update, so the values can update without refreshing the entire screen.
+  display.firstPage();
+  do
+  {
+    display.fillScreen(bg);
+
+    u8g2Fonts.setCursor(10, y); 
+    u8g2Fonts.print("Runtime:");
+    u8g2Fonts.setCursor(x, y);
+    u8g2Fonts.println(number, 1);
+  }
+  while (display.nextPage());
+}
+*/
