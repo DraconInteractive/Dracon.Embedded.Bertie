@@ -51,7 +51,7 @@ int baseServoC;
 int linkOneServoC;
 
 bool readingMic = false;
-int micDelay = 20;
+int micDelay = 5;
 std::vector<int> micBuffer;
 
 // Notes
@@ -65,17 +65,18 @@ std::vector<int> micBuffer;
 // eink to pos/neg
 // eink y18 o5 g17 w16 p4 b23
 // y->p are in order, b23 is the outlier at the far end
+// Button signal to 39
+// Mic signal to 34
 
 void displayEyes(int emote, bool refreshScreen = false);
 void displayEyesSymbol(const char* symbol, bool refreshScreen = false);
-//void displayValues();
 void displayText0(const char* inputText, bool refreshScreen = false);
 void displayServerState(bool displayOnScreen = false, bool refreshScreen = false);
 void displayTextAdv(const char* inputText, int fontSize = 4, uint16_t color = GxEPD_WHITE, int cX = 120, int cY = 80, bool refreshScreen = false);
 void setDisplayStandard();
 void scheduleInterval();
 void debug_network();
-void blinkEvent(bool refreshScreen = false);
+void blinkEvent();
 void servoTest();
 void servoReset();
 void setBaseServo (int angle);
@@ -86,7 +87,10 @@ void g_base();
 void g_yes();
 void g_no();
 void g_search();
+void g_full();
 void parseLastMessage();
+bool processMic();
+void uploadMic(WiFiClient& client);
 
 void setup()
 {
@@ -138,35 +142,6 @@ void setup()
 
 void loop()
 {
-  bool btnValue = analogRead(BTN_PIN) < 1000; // use proper threshold
-  bool uploadMicFlag = false;
-  if (btnValue && !readingMic)
-  {
-    Serial.println("Button pressed");
-    readingMic = true;
-    micBuffer.clear();
-  } else if (!btnValue && readingMic)
-  {
-    Serial.println("Button released");
-    readingMic = false;
-    uploadMicFlag = true;
-
-    for (int i = 0; i < micBuffer.size(); i++)
-    {
-      Serial.println(micBuffer[i]);
-    }
-  }
-  
-  if (readingMic)
-  {
-    int m = analogRead(MIC_PIN);
-    int barLength = map(m, 0, 4095, 0, 20);  // Adjust for ESP32's 12-bit ADC
-    
-    micBuffer.push_back(barLength);
-    delay(micDelay);
-  }
-
-  return;
   WiFiClient client = server.available();
   if (client) {
     if (client.connected())
@@ -186,6 +161,12 @@ void loop()
 
     while (client.connected())
     {
+      bool uploadMicFlag = processMic();
+      
+      if (uploadMicFlag)
+      {
+        uploadMic(client);
+      }
       int length = client.available();
       if (client.available() > 0)
       {
@@ -239,6 +220,62 @@ void loop()
   */
 
   delay(100);  
+}
+
+bool processMic() {
+  bool btnValue = analogRead(BTN_PIN) < 1000;
+  bool uploadMicFlag = false;
+  
+  if (btnValue && !readingMic)
+  {
+    Serial.println("Button pressed");
+    readingMic = true;
+    micBuffer.clear();
+  } else if (!btnValue && readingMic)
+  {
+    Serial.println("Button released");
+    readingMic = false;
+    uploadMicFlag = true;
+
+    for (int i = 0; i < micBuffer.size(); i++)
+    {
+      Serial.println(micBuffer[i]);
+    }
+    Serial.flush();
+  }
+  
+  if (readingMic)
+  {
+    int m = analogRead(MIC_PIN);
+    int barLength = map(m, 0, 4095, 0, 20);  // Adjust for ESP32's 12-bit ADC
+    
+    //micBuffer.push_back(barLength);
+    micBuffer.push_back(m);
+    delay(micDelay);
+  }
+
+  return uploadMicFlag;
+}
+
+void uploadMic(WiFiClient& client) {
+  String data = "MIC||";
+
+  Serial.print("Sending ");
+  Serial.print(micBuffer.size());
+  Serial.println(" entries to client");
+
+  for (int i = 0; i < micBuffer.size(); ++i) {
+    data += micBuffer[i];
+    if (i < micBuffer.size() - 1) {
+      data += ",";
+    }
+  }
+
+  data += "||";
+  client.print(data);
+  Serial.println("Sent");
+  delay(100);
+  client.flush();
 }
 
 void displayEyes(int emote, bool refreshScreen) {
@@ -516,6 +553,10 @@ void parseLastMessage() {
     {
       g_search();
     }
+    else if (lastMessage == "full")
+    {
+      g_full();
+    }
     else {
       displayEyesSymbol("?");
       delay(500);
@@ -583,6 +624,14 @@ void g_search() {
   displayEyes(0, true);
 }
 
+void g_full() 
+{
+  g_base();
+  g_yes();
+  g_no();
+  g_search();
+}
+
 float inverseLerp(float a, float b, float x) {
   if (a == b) { // Handle the degenerate case where the range is zero
     return (x >= a) ? 1.0 : 0.0; // Or handle as an error, depending on desired behavior
@@ -609,7 +658,6 @@ void debug_network(){
       Serial.println(WiFi.localIP());
   }
 }
-
 
 /*
 void displayValues()
