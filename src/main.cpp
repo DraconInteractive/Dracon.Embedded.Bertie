@@ -4,16 +4,43 @@
 #include <WiFi.h>
 #include <map>
 #include <Servo.h>
+#include "driver/i2s.h"
 #include <vector>
 
+// Servos
 #define SERVO_BASE_PIN 25
 #define SERVO_LINK_1_PIN 26
 
+Servo baseServo;
+Servo linkOneServo;
+
+int baseServoC;
+int linkOneServoC;
+
+// Mic
+#define I2S_PORT         I2S_NUM_0
+#define I2S_SAMPLE_RATE  16000
+#define I2S_BITS         I2S_BITS_PER_SAMPLE_16BIT
+#define I2S_DMA_BUF_LEN  256
+#define I2S_DMA_BUF_CNT  6
+
+#define BTN_PIN 22
+#define BTN_THRESHOLD    1000
+
+#define MIC_PIN 34
+
+enum RecState { Idle, Recording };
+RecState recState = Idle;
+
+bool readingMic = false;
+int micDelay = 5;
+std::vector<int> micBuffer;
+
+// Other peripherals
 #define SLIDE_PIN 0 // TODO SET PIN
 #define ROT_PIN 0 // TODO SET PIN
-#define MIC_PIN 34
-#define BTN_PIN 39
 
+// E-Ink Display (Waveshare 2.9inch)
 #define CS_PIN 5
 #define DC_PIN 17
 #define RST_PIN 16
@@ -26,6 +53,7 @@ uint16_t bg = GxEPD_WHITE;
 uint16_t fg = GxEPD_BLACK;
 U8G2_FOR_ADAFRUIT_GFX u8g2Fonts;
 
+// WIFI / TCP
 const char* ssid = "DraconE";
 const char* password = "Rarceth1996!";
 
@@ -36,25 +64,12 @@ IPAddress subnet(255, 255, 255, 0);
 
 int port = 8888;  //Port number
 WiFiServer server(port);
-
-unsigned long lastEventTime = 0;
-unsigned long nextInterval = 0;
-
-bool hasClient = false;
-bool alreadyConnected = false;
+WiFiClient activeClient;
 String lastMessage = "";
 
-Servo baseServo;
-Servo linkOneServo;
+// State flags
+bool hasClient = false;
 
-int baseServoC;
-int linkOneServoC;
-
-bool readingMic = false;
-int micDelay = 5;
-std::vector<int> micBuffer;
-
-// Notes
 
 // Wiring: 
 // Servo orange wires, base to 25, l1 to 26
@@ -68,29 +83,38 @@ std::vector<int> micBuffer;
 // Button signal to 39
 // Mic signal to 34
 
+// Display
 void displayEyes(int emote, bool refreshScreen = false);
 void displayEyesSymbol(const char* symbol, bool refreshScreen = false);
 void displayText0(const char* inputText, bool refreshScreen = false);
 void displayServerState(bool displayOnScreen = false, bool refreshScreen = false);
 void displayTextAdv(const char* inputText, int fontSize = 4, uint16_t color = GxEPD_WHITE, int cX = 120, int cY = 80, bool refreshScreen = false);
 void setDisplayStandard();
-void scheduleInterval();
-void debug_network();
-void blinkEvent();
+
+void blinkEvent(); // Not in use
+
+// Servos
 void servoTest();
 void servoReset();
 void setBaseServo (int angle);
 void setLinkOneServo (int angle);
+
+// Utilities
 float inverseLerp(float a, float b, float x);
 float lerp(float start_val, float end_val, float fraction);
+
+// Gestures
 void g_base();
 void g_yes();
 void g_no();
 void g_search();
 void g_full();
+
+// TCP / MIC
 void parseLastMessage();
-bool processMic();
-void uploadMic(WiFiClient& client);
+void setupMic();
+void processMic();
+void debug_network();
 
 void setup()
 {
@@ -111,6 +135,8 @@ void setup()
 
   //pinMode(SLIDE_PIN, INPUT);
   //pinMode(ROT_PIN, INPUT);
+
+  pinMode(BTN_PIN, INPUT_PULLUP);
 
   displayEyesSymbol("|", true);
 
@@ -137,73 +163,86 @@ void setup()
 
   server.begin(port);
 
-  scheduleInterval();
+  setupMic();
 }
 
 void loop()
 {
-  WiFiClient client = server.available();
-  if (client) {
-    if (client.connected())
-    {
-      if (!alreadyConnected)
-      {
-        Serial.println("New client connected");
-        client.flush();
-        alreadyConnected = true;
-        scheduleInterval();
-      }
-    }
-
-    hasClient = true;
-
-    displayServerState();
-
-    while (client.connected())
-    {
-      bool uploadMicFlag = processMic();
-      
-      if (uploadMicFlag)
-      {
-        uploadMic(client);
-      }
-      int length = client.available();
-      if (client.available() > 0)
-      {
-        String incoming = client.readStringUntil('\n');
-        incoming.trim();
-        lastMessage = incoming;
-
-        Serial.println("---");
-        Serial.print("Data received: ");
-        Serial.print(lastMessage);
-        Serial.println();
-
-        displayServerState();
-
-        displayEyesSymbol("!", true);
-        delay(500);
-        
-        parseLastMessage();
-
-        displayEyes(0);
-
-        scheduleInterval();
-      }
-    }
-    client.stop();
-    Serial.println("Client disconnected");
-    hasClient = false;
-    displayServerState();
-  }
-
-  /*
-  if (millis() - lastEventTime > nextInterval)
+  WiFiClient newClient = server.available();
+  if (newClient && newClient.connected())
   {
-    blinkEvent();
-    scheduleInterval();
+    activeClient = newClient;
+    hasClient = true;
+    Serial.println("Client connected");
+    activeClient.flush();
+    displayServerState();
   }
-  */
+
+  if (hasClient && !activeClient.connected())
+  {
+    hasClient = false;
+    activeClient.stop();
+    displayServerState();
+  }
+
+  bool btnHeld = digitalRead(BTN_PIN) == LOW;
+
+  if (activeClient && hasClient) {
+    switch (recState) {
+      case Idle: 
+        if (btnHeld)
+        {
+          Serial.println("Starting stream");
+          // Begin stream header
+          activeClient.println("MIC_STREAM_BEGIN");
+          activeClient.print("sr=");
+          activeClient.println(I2S_SAMPLE_RATE);
+          activeClient.println("fmt=ADC12LJ");
+          activeClient.flush();
+          // Start I2S
+          i2s_adc_enable(I2S_PORT);
+          recState = Recording;
+        }
+        break;
+      case Recording:
+        if (!btnHeld || !hasClient)
+        {
+          i2s_adc_disable(I2S_PORT);
+          if (hasClient)
+          {
+            Serial.println("Ending stream");
+            activeClient.println("MIC_STREAM_END");
+            activeClient.flush();
+          }
+          recState = Idle;
+        }
+        else {
+          processMic();
+        }
+        break;
+    }
+    
+    if (activeClient.available() > 0) // Command incoming
+    {
+      String incoming = activeClient.readStringUntil('\n');
+      incoming.trim();
+      lastMessage = incoming;
+
+      Serial.println("---");
+      Serial.print("Data received: ");
+      Serial.print(lastMessage);
+      Serial.println();
+
+      displayServerState();
+
+      displayEyesSymbol("!", true);
+      delay(500);
+      
+      parseLastMessage();
+
+      displayEyes(0);
+    }
+  }
 
   /*
   int d = analogRead(SLIDE_PIN);
@@ -219,63 +258,56 @@ void loop()
   }
   */
 
-  delay(100);  
+  switch (recState)
+  {
+    case Idle:
+      delay(100);
+      break;
+    case Recording:
+      delay(10);
+      break;
+  }
 }
 
-bool processMic() {
-  bool btnValue = analogRead(BTN_PIN) < 1000;
-  bool uploadMicFlag = false;
-  
-  if (btnValue && !readingMic)
-  {
-    Serial.println("Button pressed");
-    readingMic = true;
-    micBuffer.clear();
-  } else if (!btnValue && readingMic)
-  {
-    Serial.println("Button released");
-    readingMic = false;
-    uploadMicFlag = true;
+void setupMic() {
+  i2s_config_t cfg = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_ADC_BUILT_IN),
+    .sample_rate = I2S_SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT,
+    .communication_format = I2S_COMM_FORMAT_I2S_MSB,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    //.dma_buf_count = I2S_DMA_BUF_CNT,
+    //.dma_buf_len = I2S_DMA_BUF_LEN,
+    .dma_buf_count = 8,
+    .dma_buf_len = 512,
+    .use_apll = true,
+    .tx_desc_auto_clear = false,
+    .fixed_mclk = 0
+  };
 
-    for (int i = 0; i < micBuffer.size(); i++)
-    {
-      Serial.println(micBuffer[i]);
-    }
-    Serial.flush();
-  }
   
-  if (readingMic)
-  {
-    int m = analogRead(MIC_PIN);
-    int barLength = map(m, 0, 4095, 0, 20);  // Adjust for ESP32's 12-bit ADC
-    
-    //micBuffer.push_back(barLength);
-    micBuffer.push_back(m);
-    delay(micDelay);
-  }
-
-  return uploadMicFlag;
+  i2s_driver_install(I2S_PORT, &cfg, 0, NULL);
+  adc1_config_width(ADC_WIDTH_BIT_12);
+  adc1_config_channel_atten(ADC1_CHANNEL_6, ADC_ATTEN_DB_11); // matches ~3.3V full-scale
+  i2s_set_adc_mode(ADC_UNIT_1, ADC1_CHANNEL_6 /* GPIO34 on ESP32 */);
+  i2s_set_sample_rates(I2S_PORT, I2S_SAMPLE_RATE);
 }
 
-void uploadMic(WiFiClient& client) {
-  String data = "MIC||";
+void processMic() {
+  // Read one chunk from I2S (non-blocking-ish)
+  static uint8_t chunkBuf[1024]; // bytes (multiple of 2)
+  size_t bytes_read = 0;
+  i2s_read(I2S_PORT, chunkBuf, sizeof(chunkBuf), &bytes_read, 2 / portTICK_PERIOD_MS);
 
-  Serial.print("Sending ");
-  Serial.print(micBuffer.size());
-  Serial.println(" entries to client");
-
-  for (int i = 0; i < micBuffer.size(); ++i) {
-    data += micBuffer[i];
-    if (i < micBuffer.size() - 1) {
-      data += ",";
-    }
+  if (bytes_read > 0 && hasClient) {
+    Serial.print(". ");
+    // Prefix with "CHUNK <N>\n", then raw N bytes
+    activeClient.print("CHUNK ");
+    activeClient.println((unsigned)bytes_read);
+    activeClient.write(chunkBuf, bytes_read);
+    activeClient.flush(); // small chunks: okay; can buffer for fewer flushes if you like
   }
-
-  data += "||";
-  client.print(data);
-  Serial.println("Sent");
-  delay(100);
-  client.flush();
 }
 
 void displayEyes(int emote, bool refreshScreen) {
@@ -447,10 +479,6 @@ void displayServerState(bool displayOnScreen, bool refreshScreen) {
   while (display.nextPage());
 }
 
-void scheduleInterval() {
-    nextInterval = random(15000,30000);
-}
-
 void blinkEvent() {
     std::map<int,int> rMap;
     rMap[0] = 0;
@@ -459,7 +487,6 @@ void blinkEvent() {
     rMap[3] = 6;
     rMap[4] = 7;
 
-    lastEventTime = millis();
     displayEyes(-1);
     delay(250);
     int r = random(0,4);
@@ -658,33 +685,3 @@ void debug_network(){
       Serial.println(WiFi.localIP());
   }
 }
-
-/*
-void displayValues()
-{
-  display.fillScreen(GxEPD_WHITE);
-
-  int number; //A0 Value
-  number = millis() / 1000;  
-
-  setDisplayStandard();
-  //u8g2Fonts.setFont(u8g2_font_helvR14_tf);  // select u8g2 font from here:  https://github.com/olikraus/u8g2/wiki/fntlistall
-  
-  //u8g2Fonts.setFont(u8g2_font_logisoso32_tr); //u8g2_font_logisoso32_tn--->numbers only to save memory ; u8g2_font_logisoso32_tr , u8g2_font_logisoso32_tf -->numbers&letters
-  u8g2Fonts.setFont(u8g2_font_t0_16_tf);
-  uint16_t x = 165;
-  uint16_t y = 75;
-  display.setPartialWindow(0, 0, display.width(), 296); //this sets a window for the partial update, so the values can update without refreshing the entire screen.
-  display.firstPage();
-  do
-  {
-    display.fillScreen(bg);
-
-    u8g2Fonts.setCursor(10, y); 
-    u8g2Fonts.print("Runtime:");
-    u8g2Fonts.setCursor(x, y);
-    u8g2Fonts.println(number, 1);
-  }
-  while (display.nextPage());
-}
-*/
