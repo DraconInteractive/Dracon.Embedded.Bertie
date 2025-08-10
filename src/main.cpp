@@ -231,7 +231,7 @@ void loop()
         break;
     }
     
-    if (activeClient.available() > 0) // Command incoming
+    if (recState == Idle && activeClient.available() > 0) // Command incoming
     {
       String incoming = activeClient.readStringUntil('\n');
       incoming.trim();

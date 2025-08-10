@@ -1,8 +1,25 @@
 import socket, wave
 import numpy as np
+import os
+from dotenv import load_dotenv
+from io import BytesIO
+import requests
+from elevenlabs.client import ElevenLabs
+import re
 
 ESP32_IP = '192.168.4.51'
 ESP32_PORT = 8888
+COMMAND_PATTERNS = [
+    (r"\b(full demo|do (?:the )?full)\b", "full"),
+    (r"\b(nod|yes|affirmative|agree)\b", "nod"),
+    (r"\b(shake|no|negative|disagree)\b", "shake"),
+    (r"\bsearch|scan|look around\b", "search"),
+    (r"\breset servos?\b", "rsts"),
+    (r"\bservo test\b", "dbsrange"),
+    (r"\bdebug (?:connection|network)\b", "dbcon"),
+    (r"\bdebug (?:eyes|eye)\b", "dbi"),
+    (r"\bshow text\b", "dbtxt"),
+]
 
 class SpectralGate:
     """
@@ -242,7 +259,59 @@ class DownwardExpander:
         out = np.clip(out[:idx], -32768, 32767).astype('<i2')
         return out.tobytes()
 
-# ----------- TCP helpers -----------
+def send_command_from_transcript(sock, text) -> bool:
+    if not text:
+        print("[actions] No transcription text.")
+        return False
+    for pattern, cmd in COMMAND_PATTERNS:
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            try:
+                msg = (cmd + "\n").encode("utf-8")
+                sock.sendall(msg)
+                print(f"[actions] Matched /{pattern}/ → sent command: {cmd}")
+                return True
+            except OSError as e:
+                print(f"[actions] Send failed: {e}")
+                return False
+    print("[actions] No patterns matched.")
+    return False
+
+def transcribe_with_elevenlabs(wav_path: str, model_id="scribe_v1",
+                               language_code="eng", diarize=True, tag_audio_events=True):
+    """
+    Returns the transcription dict from ElevenLabs.
+    Requires ELEVEN_API_KEY in environment (or .env if using python-dotenv).
+    """
+    try:
+        # optional: load .env if present
+        try:
+            from dotenv import load_dotenv
+            load_dotenv()
+        except Exception:
+            pass
+
+        api_key = os.getenv("ELEVEN_API_KEY")
+        if not api_key:
+            raise RuntimeError("Missing ELEVEN_API_KEY. Put it in your environment or .env")
+
+        from elevenlabs.client import ElevenLabs
+        client = ElevenLabs(api_key=api_key)
+
+        with open(wav_path, "rb") as f:
+            audio_bytes = f.read()
+
+        bio = BytesIO(audio_bytes)
+        result = client.speech_to_text.convert(
+            file=bio,
+            model_id=model_id,
+            language_code=language_code,  # or None to auto-detect
+            diarize=diarize,
+            tag_audio_events=tag_audio_events,
+        )
+        return result
+    except Exception as e:
+        print(f"[transcribe] error: {e}")
+        return None
 
 def apply_gain_i16(pcm_bytes: bytes, gain_db: float) -> bytes:
     if not pcm_bytes:
@@ -271,8 +340,6 @@ def read_n_bytes(sock, n):
         data += chunk
     return bytes(data)
 
-# ----------- ADC12LJ -> PCM16 -----------
-
 def adc12lj_to_pcm16(payload_bytes: bytes) -> bytes:
     if len(payload_bytes) & 1:
         payload_bytes = payload_bytes[:-1]
@@ -281,8 +348,6 @@ def adc12lj_to_pcm16(payload_bytes: bytes) -> bytes:
     s12 = u12 - 2048                                     # center
     s16 = np.clip(s12 * 16, -32768, 32767).astype('<i2')
     return s16.tobytes()
-
-# ----------- Receiver -----------
 
 def rms_dbfs_i16(pcm_bytes: bytes) -> float:
     if not pcm_bytes: return -120.0
@@ -415,6 +480,25 @@ def receive_stream():
                 wf.writeframes(pcm)
 
         print("WAV saved: capture.wav")
+        # Kick off transcription
+        resp = transcribe_with_elevenlabs("capture.wav",
+                                          model_id="scribe_v1",
+                                          language_code="eng",
+                                          diarize=False,
+                                          tag_audio_events=False)
+        if resp is None:
+            print("Transcription failed.")
+        else:
+            # ElevenLabs returns a dict-like object; print the text field(s)
+            # If the SDK structure changes, print(resp) to inspect.
+            # Commonly, you can access .text or ['text'] depending on SDK version:
+            text = getattr(resp, "text", None)
+            if text is None and isinstance(resp, dict):
+                text = resp.get("text")
+            print("---- Transcription ----")
+            print(text or resp)
+
+            _ = send_command_from_transcript(s, text if isinstance(text, str) else "")
 
 if __name__ == "__main__":
     receive_stream()
