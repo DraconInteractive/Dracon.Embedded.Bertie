@@ -116,6 +116,12 @@ void setupMic();
 void processMic();
 void debug_network();
 
+// Flush policy
+static uint32_t lastFlushMs = 0;
+static uint16_t chunksSinceFlush = 0;
+static const uint16_t FLUSH_EVERY_N_CHUNKS = 8;  // tune: 4–16 are typical
+static const uint32_t FLUSH_EVERY_MS      = 50;  // tune: 20–100 ms
+
 void setup()
 {
   Serial.begin(115200);
@@ -202,6 +208,9 @@ void loop()
           // Start I2S
           i2s_adc_enable(I2S_PORT);
           recState = Recording;
+          
+          lastFlushMs = millis();
+          chunksSinceFlush = 0;
         }
         break;
       case Recording:
@@ -289,24 +298,48 @@ void setupMic() {
   
   i2s_driver_install(I2S_PORT, &cfg, 0, NULL);
   adc1_config_width(ADC_WIDTH_BIT_12);
-  adc1_config_channel_atten(ADC1_CHANNEL_6, ADC_ATTEN_DB_11); // matches ~3.3V full-scale
+  adc1_config_channel_atten(ADC1_CHANNEL_6, ADC_ATTEN_DB_0); // matches ~3.3V full-scale
   i2s_set_adc_mode(ADC_UNIT_1, ADC1_CHANNEL_6 /* GPIO34 on ESP32 */);
   i2s_set_sample_rates(I2S_PORT, I2S_SAMPLE_RATE);
 }
 
 void processMic() {
-  // Read one chunk from I2S (non-blocking-ish)
-  static uint8_t chunkBuf[1024]; // bytes (multiple of 2)
+  static uint8_t chunkBuf[1024];
   size_t bytes_read = 0;
-  i2s_read(I2S_PORT, chunkBuf, sizeof(chunkBuf), &bytes_read, 2 / portTICK_PERIOD_MS);
+  i2s_read(I2S_PORT, chunkBuf, sizeof(chunkBuf), &bytes_read, 20 / portTICK_PERIOD_MS);
 
   if (bytes_read > 0 && hasClient) {
-    Serial.print(". ");
-    // Prefix with "CHUNK <N>\n", then raw N bytes
+    // Sanity print
+    if (bytes_read > 0) {
+        int16_t *p = (int16_t*)chunkBuf;
+        int n = bytes_read / 2;
+        uint16_t minw=0xFFFF, maxw=0, minu=4095, maxu=0;
+        for (int i=0; i<n; ++i) {
+          uint16_t w = (uint16_t)p[i];
+          uint16_t u = (w >> 4) & 0x0FFF;
+          if (w < minw) minw = w;
+          if (w > maxw) maxw = w;
+          if (u < minu) minu = u;
+          if (u > maxu) maxu = u;
+        }
+      static bool once=false;
+      if (!once) {
+        once = true;
+        Serial.printf("I2S raw min/max: 0x%04X / 0x%04X  | u12 min/max: %u / %u\n", minw, maxw, minu, maxu);
+      }
+    }
     activeClient.print("CHUNK ");
     activeClient.println((unsigned)bytes_read);
     activeClient.write(chunkBuf, bytes_read);
-    activeClient.flush(); // small chunks: okay; can buffer for fewer flushes if you like
+
+    // Flush policy: every N chunks OR after X ms, whichever comes first
+    chunksSinceFlush++;
+    uint32_t now = millis();
+    if (chunksSinceFlush >= FLUSH_EVERY_N_CHUNKS || (now - lastFlushMs) >= FLUSH_EVERY_MS) {
+      activeClient.flush();
+      chunksSinceFlush = 0;
+      lastFlushMs = now;
+    }
   }
 }
 
