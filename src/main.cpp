@@ -6,6 +6,7 @@
 #include <Servo.h>
 #include "driver/i2s.h"
 #include <vector>
+#include <Wire.h>
 
 // Servos
 #define SERVO_BASE_PIN 25
@@ -34,7 +35,6 @@ RecState recState = Idle;
 
 bool readingMic = false;
 int micDelay = 5;
-std::vector<int> micBuffer;
 
 // Other peripherals
 #define SLIDE_PIN 0 // TODO SET PIN
@@ -80,7 +80,7 @@ bool hasClient = false;
 // eink to pos/neg
 // eink y18 o5 g17 w16 p4 b23
 // y->p are in order, b23 is the outlier at the far end
-// Button signal to 39
+
 // Mic signal to 34
 
 // Display
@@ -126,8 +126,9 @@ void setup()
 {
   Serial.begin(115200);
 
+  analogSetWidth(12); // 16 bit
   analogSetAttenuation(ADC_11db);
-  micBuffer.reserve(1024);
+  analogSetPinAttenuation(MIC_PIN, ADC_11db);
 
   randomSeed(analogRead(0));
 
@@ -156,10 +157,9 @@ void setup()
   }
 
   g_base();
-  delay(200);
-  displayEyes(7);
-  delay(200);
-  displayEyes(0);
+  displayEyesSymbol("-", true);
+
+  delay(350);
 
   Serial.print("W: "); Serial.println(display.width());
   Serial.print("H: "); Serial.println(display.height());
@@ -170,6 +170,9 @@ void setup()
   server.begin(port);
 
   setupMic();
+
+  displayEyes(0);
+  delay(500);
 }
 
 void loop()
@@ -205,6 +208,7 @@ void loop()
           activeClient.println(I2S_SAMPLE_RATE);
           activeClient.println("fmt=ADC12LJ");
           activeClient.flush();
+
           // Start I2S
           i2s_adc_enable(I2S_PORT);
           recState = Recording;
@@ -616,6 +620,10 @@ void parseLastMessage() {
     else if (lastMessage == "full")
     {
       g_full();
+    }
+    else if (lastMessage == "restart")
+    {
+      ESP.restart();
     }
     else {
       displayEyesSymbol("?");

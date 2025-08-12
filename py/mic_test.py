@@ -261,7 +261,9 @@ class DownwardExpander:
 
 def send_command_from_transcript(sock, text) -> bool:
     if not text:
-        print("[actions] No transcription text.")
+        print("[actions] No transcription text. Sent command: 'None'");
+        msg = ("None\n").encode("utf-8");
+        sock.sendall(msg);
         return False
     for pattern, cmd in COMMAND_PATTERNS:
         if re.search(pattern, text, flags=re.IGNORECASE):

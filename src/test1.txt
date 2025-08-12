@@ -1,83 +1,731 @@
-
-#include <SPI.h>
+#define ENABLE_GxEPD2_GFX 1
 #include <GxEPD2_BW.h>
-#include <GxEPD2.h>
-#include <Fonts/FreeMonoBold12pt7b.h>
-#include <Arduino.h>
+#include <U8g2_for_Adafruit_GFX.h>
+#include <WiFi.h>
+#include <map>
+#include <Servo.h>
+#include "driver/i2s.h"
+#include <vector>
 
-// Pin definitions
+// Servos
+#define SERVO_BASE_PIN 25
+#define SERVO_LINK_1_PIN 26
+
+Servo baseServo;
+Servo linkOneServo;
+
+int baseServoC;
+int linkOneServoC;
+
+// Mic
+#define I2S_PORT         I2S_NUM_0
+#define I2S_SAMPLE_RATE  16000
+#define I2S_BITS         I2S_BITS_PER_SAMPLE_16BIT
+#define I2S_DMA_BUF_LEN  256
+#define I2S_DMA_BUF_CNT  6
+
+#define BTN_PIN 22
+#define BTN_THRESHOLD    1000
+
+#define MIC_PIN 34
+
+enum RecState { Idle, Recording };
+RecState recState = Idle;
+
+bool readingMic = false;
+int micDelay = 5;
+
+// Other peripherals
+#define SLIDE_PIN 0 // TODO SET PIN
+#define ROT_PIN 0 // TODO SET PIN
+
+// E-Ink Display (Waveshare 2.9inch)
 #define CS_PIN 5
 #define DC_PIN 17
 #define RST_PIN 16
 #define BUSY_PIN 4
 
-/*
-MAKE SURE YOU ARE USING THE APPROPRIATE DISPLAY
-either: https://www.waveshare.com/product/displays/e-paper/epaper-2/4.2inch-e-paper-module.htm
-or: https://www.waveshare.com/2.9inch-e-Paper-Module.htm
-
-It must be a V2 || rev2.1 e-paper module or raw display
-*/
-
-// IF YOU ARE USING THE LARGER 4INCH DISPLAY YOU WILL NEED TO USE GxEPD2_420_GDEY042T81 instead of GxEPD2_290_BS on the next line
+#define MAX_DISPLAY_BUFFER_SIZE 800 
+#define MAX_HEIGHT(EPD) (EPD::HEIGHT <= MAX_DISPLAY_BUFFER_SIZE / (EPD::WIDTH / 8) ? EPD::HEIGHT : MAX_DISPLAY_BUFFER_SIZE / (EPD::WIDTH / 8))
 GxEPD2_BW<GxEPD2_290_BS, GxEPD2_290_BS::HEIGHT> display(GxEPD2_290_BS(/*CS=D8*/ SS, /*DC=D3*/ DC_PIN, /*RST=D4*/ RST_PIN, /*BUSY=D2*/ BUSY_PIN)); // DEPG0290BS 128x296, SSD1680
+uint16_t bg = GxEPD_WHITE;
+uint16_t fg = GxEPD_BLACK;
+U8G2_FOR_ADAFRUIT_GFX u8g2Fonts;
 
-void writeTestText() {
-  Serial.println("Set partial");
-  display.setPartialWindow(0, 0, display.width(), 296); //this sets a window for the partial update, so the values can update without refreshing the entire screen.
-  
-  Serial.println("first page");
-  display.firstPage();
-  do {
-    display.setCursor(0, 15);  // Set the cursor position
-    display.setTextColor(GxEPD_BLACK);  // Set the text color
-	  display.setFont(&FreeMonoBold12pt7b); // set the font you want to use
-	  display.setTextSize(1); // set a font size
-    Serial.println("print");
-    display.print("Test: ");  // Print text
-    display.print(millis());
-    Serial.println("display");
-    display.display(); // make sure you call display after you update the screen content
-  } while (display.nextPage());
-}
+// WIFI / TCP
+const char* ssid = "DraconE";
+const char* password = "Rarceth1996!";
 
-void writeText(const char* inputText, int xPos, int yPos) {
-  Serial.print("Writing text: ");
-  Serial.println(inputText);
+IPAddress static_ip(192,168,4,51);
+IPAddress dns(192,168,4,1);
+IPAddress gateway(192,168,4,1);
+IPAddress subnet(255, 255, 255, 0);
 
-  display.setPartialWindow(0, 0, display.width(), 296); //this sets a window for the partial update, so the values can update without refreshing the entire screen.
-  display.setTextColor(GxEPD_BLACK);  // Set the text color
-  display.setFont(&FreeMonoBold12pt7b); // set the font you want to use
-  display.setTextSize(1); // set a font size
+int port = 8888;  //Port number
+WiFiServer server(port);
+WiFiClient activeClient;
+String lastMessage = "";
 
-  display.firstPage();
-  do {
-    display.setCursor(xPos, yPos);  // Set the cursor position
-    display.print(inputText);  // Print text
-    display.display(); // make sure you call display after you update the screen content
-  } while (display.nextPage());
-}
+// State flags
+bool hasClient = false;
 
-void setupDisplay(bool useBlackBackgroundWhiteText = false, int16_t cs = SS, int16_t dc = DC_PIN, int16_t rst = RST_PIN, int16_t busy = BUSY, uint32_t baud = 115200, uint8_t rotation = 3) 
+
+// Wiring: 
+// Servo orange wires, base to 25, l1 to 26
+// battery to pos/neg
+// servos to pos/neg
+// esp32 ground to neg
+// esp32 power via usb
+// eink to pos/neg
+// eink y18 o5 g17 w16 p4 b23
+// y->p are in order, b23 is the outlier at the far end
+
+// Mic signal to 34
+
+// Display
+void displayEyes(int emote, bool refreshScreen = false);
+void displayEyesSymbol(const char* symbol, bool refreshScreen = false);
+void displayText0(const char* inputText, bool refreshScreen = false);
+void displayServerState(bool displayOnScreen = false, bool refreshScreen = false);
+void displayTextAdv(const char* inputText, int fontSize = 4, uint16_t color = GxEPD_WHITE, int cX = 120, int cY = 80, bool refreshScreen = false);
+void setDisplayStandard();
+
+void blinkEvent(); // Not in use
+
+// Servos
+void servoTest();
+void servoReset();
+void setBaseServo (int angle);
+void setLinkOneServo (int angle);
+
+// Utilities
+float inverseLerp(float a, float b, float x);
+float lerp(float start_val, float end_val, float fraction);
+
+// Gestures
+void g_base();
+void g_yes();
+void g_no();
+void g_search();
+void g_full();
+
+// TCP / MIC
+void parseLastMessage();
+void setupMic();
+void processMic();
+void debug_network();
+
+// Flush policy
+static uint32_t lastFlushMs = 0;
+static uint16_t chunksSinceFlush = 0;
+static const uint16_t FLUSH_EVERY_N_CHUNKS = 8;  // tune: 4–16 are typical
+static const uint32_t FLUSH_EVERY_MS      = 50;  // tune: 20–100 ms
+
+void setup()
 {
-  Serial.println("Setting up display");
-  display.init(baud);  // Initialize the display with a baud rate
-  display.setRotation(rotation);
-  Serial.println("Setting full window");
-  display.fillScreen(GxEPD_WHITE);
-}
-
-void setup() {
   Serial.begin(115200);
-	setupDisplay(); // run the function that initializes the display.
+
+  analogSetWidth(12); // 16 bit
+  analogSetAttenuation(ADC_11db);
+  analogSetPinAttenuation(MIC_PIN, ADC_11db);
+
+  randomSeed(analogRead(0));
+
+  display.init();
+  u8g2Fonts.begin(display); // connect u8g2 procedures to Adafruit GFX
+
+  delay(500);
+
+  baseServo.attach(SERVO_BASE_PIN);
+  linkOneServo.attach(SERVO_LINK_1_PIN);
+
+  //pinMode(SLIDE_PIN, INPUT);
+  //pinMode(ROT_PIN, INPUT);
+
+  pinMode(BTN_PIN, INPUT_PULLUP);
+
+  displayEyesSymbol("|", true);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.config(static_ip, gateway, subnet, dns);
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(100);
+  }
+
+  g_base();
+  displayEyesSymbol("-", true);
+
+  delay(350);
+
+  Serial.print("W: "); Serial.println(display.width());
+  Serial.print("H: "); Serial.println(display.height());
+
+  displayServerState();
+  debug_network();
+
+  server.begin(port);
+
+  //setupMic();
+
+  displayEyes(0);
+  delay(500);
 }
 
-void loop() {
-  Serial.println("fill");
-  display.fillScreen(GxEPD_WHITE);
-  Serial.println("start test");
-  writeTestText();
-  Serial.println("finish and delay");
-  delay(1000);
+static uint32_t t0 = 0;
 
+void loop()
+{
+  WiFiClient newClient = server.available();
+  if (newClient && newClient.connected())
+  {
+    activeClient = newClient;
+    hasClient = true;
+    Serial.println("Client connected");
+    activeClient.flush();
+    displayServerState();
+  }
+
+  if (hasClient && !activeClient.connected())
+  {
+    hasClient = false;
+    activeClient.stop();
+    displayServerState();
+  }
+
+  bool btnHeld = digitalRead(BTN_PIN) == LOW;
+
+  if (activeClient && hasClient) {
+    switch (recState) {
+      case Idle: 
+        if (btnHeld)
+        {
+          Serial.println("Starting stream");
+          // Begin stream header
+          activeClient.println("MIC_STREAM_BEGIN");
+          activeClient.print("sr=");
+          activeClient.println(I2S_SAMPLE_RATE);
+          activeClient.println("fmt=ADC12LJ");
+          activeClient.flush();
+
+          // Start I2S
+          //i2s_adc_enable(I2S_PORT);
+          recState = Recording;
+          
+          lastFlushMs = millis();
+          chunksSinceFlush = 0;
+        }
+        break;
+      case Recording:
+        if (!btnHeld || !hasClient)
+        {
+          //i2s_adc_disable(I2S_PORT);
+          if (hasClient)
+          {
+            Serial.println("Ending stream");
+            activeClient.println("MIC_STREAM_END");
+            activeClient.flush();
+          }
+          recState = Idle;
+        }
+        else {
+          //processMic();
+          Serial.println(analogRead(MIC_PIN));
+        }
+        break;
+    }
+    
+    if (recState == Idle && activeClient.available() > 0) // Command incoming
+    {
+      String incoming = activeClient.readStringUntil('\n');
+      incoming.trim();
+      lastMessage = incoming;
+
+      Serial.println("---");
+      Serial.print("Data received: ");
+      Serial.print(lastMessage);
+      Serial.println();
+
+      displayServerState();
+
+      displayEyesSymbol("!", true);
+      delay(500);
+      
+      parseLastMessage();
+
+      displayEyes(0);
+    }
+  }
+
+  /*
+  int d = analogRead(SLIDE_PIN);
+  float n = inverseLerp(0, 4095, d); // map slide to float
+  int m = (int)lerp(0, 180, n); // map float to angle
+  Serial.print(" M: ");
+  Serial.println(m);
+
+  if (abs(m - baseServoC) > 3)
+  {
+    baseServo.write(m);
+    baseServoC = m;
+  }
+  */
+
+  switch (recState)
+  {
+    case Idle:
+      delay(100);
+      break;
+    case Recording:
+      delay(10);
+      break;
+  }
+}
+
+void setupMic() {
+  i2s_config_t cfg = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_ADC_BUILT_IN),
+    .sample_rate = I2S_SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT,
+    .communication_format = I2S_COMM_FORMAT_I2S_MSB,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    //.dma_buf_count = I2S_DMA_BUF_CNT,
+    //.dma_buf_len = I2S_DMA_BUF_LEN,
+    .dma_buf_count = 8,
+    .dma_buf_len = 512,
+    .use_apll = true,
+    .tx_desc_auto_clear = false,
+    .fixed_mclk = 0
+  };
+
+  
+  i2s_driver_install(I2S_PORT, &cfg, 0, NULL);
+  adc1_config_width(ADC_WIDTH_BIT_12);
+  adc1_config_channel_atten(ADC1_CHANNEL_6, ADC_ATTEN_DB_0); // matches ~3.3V full-scale
+  i2s_set_adc_mode(ADC_UNIT_1, ADC1_CHANNEL_6 /* GPIO34 on ESP32 */);
+  i2s_set_sample_rates(I2S_PORT, I2S_SAMPLE_RATE);
+}
+
+void processMic() {
+  Serial.println(analogRead(34));
+  static uint8_t chunkBuf[1024];
+  size_t bytes_read = 0;
+  i2s_read(I2S_PORT, chunkBuf, sizeof(chunkBuf), &bytes_read, 20 / portTICK_PERIOD_MS);
+
+  if (bytes_read > 0 && hasClient) {
+    // Sanity print
+    if (bytes_read > 0) {
+        int16_t *p = (int16_t*)chunkBuf;
+        int n = bytes_read / 2;
+        uint16_t minw=0xFFFF, maxw=0, minu=4095, maxu=0;
+        for (int i=0; i<n; ++i) {
+          uint16_t w = (uint16_t)p[i];
+          uint16_t u = (w >> 4) & 0x0FFF;
+          if (w < minw) minw = w;
+          if (w > maxw) maxw = w;
+          if (u < minu) minu = u;
+          if (u > maxu) maxu = u;
+        }
+      static bool once=false;
+      if (!once) {
+        once = true;
+        Serial.printf("I2S raw min/max: 0x%04X / 0x%04X  | u12 min/max: %u / %u\n", minw, maxw, minu, maxu);
+      }
+    }
+    activeClient.print("CHUNK ");
+    activeClient.println((unsigned)bytes_read);
+    activeClient.write(chunkBuf, bytes_read);
+
+    // Flush policy: every N chunks OR after X ms, whichever comes first
+    chunksSinceFlush++;
+    uint32_t now = millis();
+    if (chunksSinceFlush >= FLUSH_EVERY_N_CHUNKS || (now - lastFlushMs) >= FLUSH_EVERY_MS) {
+      activeClient.flush();
+      chunksSinceFlush = 0;
+      lastFlushMs = now;
+    }
+  }
+}
+
+void displayEyes(int emote, bool refreshScreen) {
+  display.setRotation(3);
+  display.setPartialWindow(0, 0, display.width(), display.height());
+  display.firstPage();
+  do {
+    if (refreshScreen)
+    {
+      display.fillScreen(bg);
+    }
+
+    // Draw left eye
+    display.fillCircle(90, 60, 35, GxEPD_BLACK);
+
+    // Draw right eye
+    display.fillCircle(210, 60, 35, GxEPD_BLACK);
+
+    switch (emote) {
+      case -1: // No eyes
+        break;
+      case 0: // Standard
+        display.fillCircle(90, 65, 8, GxEPD_WHITE);
+        display.fillCircle(210, 65, 8, GxEPD_WHITE);
+        break;
+      case 2: // Wide
+        display.fillCircle(90, 65, 14, GxEPD_WHITE);
+        display.fillCircle(210, 65, 14, GxEPD_WHITE);
+        Serial.println("Showing wide");
+        break;
+      case 6: // Happy
+        display.fillCircle(90, 65, 14, GxEPD_WHITE);
+        display.fillCircle(210, 65, 14, GxEPD_WHITE);
+        display.fillCircle(90, 75, 14, GxEPD_BLACK);
+        display.fillCircle(210, 75, 14, GxEPD_BLACK);
+        Serial.println("Showing happy");
+        break;
+      case 7: // Sad
+        display.fillCircle(90, 65, 14, GxEPD_WHITE);
+        display.fillCircle(210, 65, 14, GxEPD_WHITE);
+        display.fillCircle(90, 55, 14, GxEPD_BLACK);
+        display.fillCircle(210, 55, 14, GxEPD_BLACK);
+        Serial.println("Showing sad");
+        break;
+    }
+    
+
+  } while (display.nextPage());
+}
+
+void displayEyesSymbol(const char* symbol, bool refreshScreen)
+{
+  display.setRotation(3);
+  display.setPartialWindow(0, 0, display.width(), display.height());
+  display.firstPage();
+  do {
+    if (refreshScreen)
+    {
+      display.fillScreen(bg);
+    }
+
+    // Draw left eye
+    display.fillCircle(90, 60, 35, GxEPD_BLACK);
+    // Draw right eye
+    display.fillCircle(210, 60, 35, GxEPD_BLACK);
+
+    display.setTextColor(GxEPD_WHITE); 
+    display.setTextSize(4);            
+    display.setCursor(80, 50);         
+    display.print(symbol);                
+
+    display.setCursor(200, 50);        
+    display.print(symbol);      
+    
+
+  } while (display.nextPage());
+}
+
+void setDisplayStandard() {
+  display.setRotation(3); // 0--> No rotation ,  1--> rotate 90 deg
+  u8g2Fonts.setFontMode(1);                 // use u8g2 transparent mode (this is default)
+  u8g2Fonts.setFontDirection(0);            // left to right (this is default)
+  u8g2Fonts.setForegroundColor(fg);         // apply Adafruit GFX color
+  u8g2Fonts.setBackgroundColor(bg);         // apply Adafruit GFX color
+}
+
+void displayText0(const char* inputText, bool refreshScreen) {
+  setDisplayStandard();
+  u8g2Fonts.setFont(u8g2_font_logisoso32_tr); //u8g2_font_logisoso32_tn--->numbers only to save memory ; u8g2_font_logisoso32_tr , u8g2_font_logisoso32_tf -->numbers&letters
+  uint16_t x = 165;
+  uint16_t y = 75;
+  display.setPartialWindow(0, 0, display.width(), 296); //this sets a window for the partial update, so the values can update without refreshing the entire screen.
+  display.firstPage();
+  do
+  {
+    if (refreshScreen)
+    {
+      display.fillScreen(bg);
+    }
+
+    u8g2Fonts.setCursor(10, y); 
+    u8g2Fonts.print(inputText);
+  }
+  while (display.nextPage());
+}
+
+void displayTextAdv(const char* inputText, int fontSize, uint16_t color, int cX, int cY, bool refreshScreen)
+{
+  display.setRotation(3);
+  display.setPartialWindow(0, 0, display.width(), display.height());
+  display.firstPage();
+  do {
+    if (refreshScreen)
+    {
+      display.fillScreen(bg);
+    }
+
+    display.setTextColor(color); 
+    display.setTextSize(fontSize);            
+    display.setCursor(cX, cY);         
+    display.print(inputText);                 
+
+  } while (display.nextPage());
+}
+
+void displayServerState(bool displayOnScreen, bool refreshScreen) {
+  Serial.println("---");
+  Serial.println("Server State");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+  Serial.print("Connected: ");
+  Serial.println(hasClient ? "True" : "False");
+  Serial.print("Last: ");
+  Serial.println(lastMessage);
+
+  if (!displayOnScreen)
+  {
+    return;
+  }
+  
+  u8g2Fonts.setFont(u8g2_font_t0_16_tf);
+  uint16_t x = 40;
+  uint16_t y = 25;
+  display.setPartialWindow(0, 0, display.width(), 296); //this sets a window for the partial update, so the values can update without refreshing the entire screen.
+  display.firstPage();
+  do
+  {
+    if (refreshScreen)
+    {
+      display.fillScreen(bg);
+    }
+    
+    u8g2Fonts.setCursor(x, y); 
+    u8g2Fonts.print("IP:");
+    u8g2Fonts.setCursor(x + 100, y); 
+    u8g2Fonts.print(WiFi.localIP().toString().c_str());
+
+    u8g2Fonts.setCursor(x, y + 25);
+    u8g2Fonts.print("Connected:");
+    u8g2Fonts.setCursor(x + 100, y + 25);
+    u8g2Fonts.print(hasClient ? "True" : "False");
+
+    u8g2Fonts.setCursor(x, y + 75);
+    u8g2Fonts.print("Last:");
+    u8g2Fonts.setCursor(x + 100, y + 75);
+    u8g2Fonts.print(lastMessage);
+
+  }
+  while (display.nextPage());
+}
+
+void blinkEvent() {
+    std::map<int,int> rMap;
+    rMap[0] = 0;
+    rMap[1] = 1;
+    rMap[2] = 2;
+    rMap[3] = 6;
+    rMap[4] = 7;
+
+    displayEyes(-1);
+    delay(250);
+    int r = random(0,4);
+    displayEyes(rMap[r]);
+    delay(750);
+    displayEyes(-1);
+    delay(250);
+    displayEyes(0);
+}
+
+void servoTest() {
+  displayEyesSymbol("8");
+  for(int angle = 0; angle <= 180; angle++) {
+    setBaseServo(angle);
+    setLinkOneServo(angle);
+    delay(15); // Small delay for smoother movement
+  }
+
+  delay(1000); // Pause for a second at the end
+
+  // Rotate all servos back from 180 to 0 degrees
+  for(int angle = 180; angle >= 0; angle--) {
+    setBaseServo(angle);
+    setLinkOneServo(angle);
+    delay(15); // Small delay for smoother movement
+  }
+
+  delay(1000); // Pause for a second at the end
+}
+
+void servoReset() {
+  setBaseServo(90);
+  setLinkOneServo(90);
+}
+
+void setBaseServo (int angle) {
+  angle = max(0, angle);
+  angle = min(angle, 180);
+  baseServo.write(angle);
+  baseServoC = angle;
+}
+
+void setLinkOneServo (int angle) {
+  angle = max(0, angle);
+  angle = min(angle, 180);
+  linkOneServo.write(angle);
+  linkOneServoC = angle;
+}
+
+void parseLastMessage() {
+    if (lastMessage == "dbi") // debug eyes
+    {
+      displayEyesSymbol(">", true);
+      delay(500);
+    }
+    else if (lastMessage == "dbsrange") // do full range servo test
+    {
+      servoTest();
+      delay(100);
+    }
+    else if (lastMessage == "rsts") // reset servo
+    {
+      servoReset();
+    }
+    else if (lastMessage == "dbcon") // debug connection
+    {
+      displayServerState(true, true);
+      delay(100);
+    }
+    else if (lastMessage == "dbtxt") // debug sub text
+    {
+      const char* txt = "Hello!";
+      displayTextAdv(txt, 2, GxEPD_BLACK, 128 - (strlen(txt) * 5), 90, true);
+      delay(1000);
+      const char* txt2 = "Hello friend!";
+      displayTextAdv(txt2, 2, GxEPD_BLACK, 128 - (strlen(txt2) * 5), 90, true);
+      delay(1000);
+      const char* txt3 = "Hello friend! Welcome!";
+      displayTextAdv(txt3, 2, GxEPD_BLACK, 128 - (strlen(txt3) * 5), 90, true);
+      delay(1000);
+    }
+    else if (lastMessage == "nod")
+    {
+      g_yes();
+    }
+    else if (lastMessage == "shake")
+    {
+      g_no();
+    }
+    else if (lastMessage == "search")
+    {
+      g_search();
+    }
+    else if (lastMessage == "full")
+    {
+      g_full();
+    }
+    else if (lastMessage == "restart")
+    {
+      ESP.restart();
+    }
+    else {
+      displayEyesSymbol("?");
+      delay(500);
+    }
+}
+
+void g_base() {
+  displayEyes(0);
+  setBaseServo(90);
+  setLinkOneServo(110);
+}
+
+void g_yes() {
+  displayEyes(6, true);
+  delay(200);
+  setLinkOneServo(linkOneServoC - 25);
+  delay(300);
+  setLinkOneServo(linkOneServoC + 50);
+  delay(300);
+  setLinkOneServo(linkOneServoC - 50);
+  delay(300);
+  setLinkOneServo(linkOneServoC + 50);
+  delay(300);
+  setLinkOneServo(linkOneServoC - 25);
+  displayEyes(0, true);
+}
+
+void g_no() {
+  displayEyes(7, true);
+  delay(200);
+  setBaseServo(baseServoC - 25);
+  delay(300);
+  setBaseServo(baseServoC + 50);
+  delay(300);
+  setBaseServo(baseServoC - 50);
+  delay(300);
+  setBaseServo(baseServoC + 50);
+  delay(300);
+  setBaseServo(baseServoC - 25);
+  displayEyes(0, true);
+}
+
+void g_search() {
+  displayEyesSymbol("?", true);
+  delay(200);
+  setBaseServo(90);
+  setLinkOneServo(90);
+  for (int i = 90; i > 60; i -= 5)
+  {
+    setLinkOneServo(i);
+    delay(100);
+  }
+  for (int i = 90; i < 140; i += 5) {
+    setBaseServo(i);
+    delay(100);
+  }
+  for (int i = 140; i > 50; i -= 5) {
+    setBaseServo(i);
+    delay(100);
+  }
+  delay(300);
+  setBaseServo(90);
+  delay(100);
+  g_base();
+  displayEyes(0, true);
+}
+
+void g_full() 
+{
+  g_base();
+  g_yes();
+  g_no();
+  g_search();
+}
+
+float inverseLerp(float a, float b, float x) {
+  if (a == b) { // Handle the degenerate case where the range is zero
+    return (x >= a) ? 1.0 : 0.0; // Or handle as an error, depending on desired behavior
+  }
+  return (x - a) / (b - a);
+}
+
+float lerp(float start_val, float end_val, float fraction) {
+  return start_val + (end_val - start_val) * fraction;
+}
+
+void debug_network(){
+  if(WiFi.status() == WL_CONNECTED) {
+      Serial.print("[*] Network information for ");
+      Serial.println(ssid);
+
+      Serial.println("[+] BSSID : " + WiFi.BSSIDstr());
+      Serial.print("[+] Gateway IP : ");
+      Serial.println(WiFi.gatewayIP());
+      Serial.print("[+] Subnet Mask : ");
+      Serial.println(WiFi.subnetMask());
+      Serial.println((String)"[+] RSSI : " + WiFi.RSSI() + " dB");
+      Serial.print("[+] ESP32 IP : ");
+      Serial.println(WiFi.localIP());
+  }
 }
