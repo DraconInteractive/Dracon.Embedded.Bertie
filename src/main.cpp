@@ -1,22 +1,13 @@
 #define ENABLE_GxEPD2_GFX 1
-#include <GxEPD2_BW.h>
-#include <U8g2_for_Adafruit_GFX.h>
+
 #include <WiFi.h>
 #include <map>
-#include <Servo.h>
 #include "driver/i2s.h"
 #include <vector>
 #include <Wire.h>
 
-// Servos
-#define SERVO_BASE_PIN 25
-#define SERVO_LINK_1_PIN 26
-
-Servo baseServo;
-Servo linkOneServo;
-
-int baseServoC;
-int linkOneServoC;
+#include "Eyes.h"
+#include "Motors.h"
 
 // Mic
 #define I2S_PORT         I2S_NUM_0
@@ -55,7 +46,7 @@ static const uint16_t IR_PERIOD_MS = 500; // 15 = ~66 Hz
 
 #define MAX_DISPLAY_BUFFER_SIZE 800 
 #define MAX_HEIGHT(EPD) (EPD::HEIGHT <= MAX_DISPLAY_BUFFER_SIZE / (EPD::WIDTH / 8) ? EPD::HEIGHT : MAX_DISPLAY_BUFFER_SIZE / (EPD::WIDTH / 8))
-GxEPD2_BW<GxEPD2_290_BS, GxEPD2_290_BS::HEIGHT> display(GxEPD2_290_BS(/*CS=D8*/ SS, /*DC=D3*/ DC_PIN, /*RST=D4*/ RST_PIN, /*BUSY=D2*/ BUSY_PIN)); // DEPG0290BS 128x296, SSD1680
+Display290 display(GxEPD2_290_BS(/*CS=D8*/ SS, /*DC=D3*/ DC_PIN, /*RST=D4*/ RST_PIN, /*BUSY=D2*/ BUSY_PIN)); // DEPG0290BS 128x296, SSD1680
 uint16_t bg = GxEPD_WHITE;
 uint16_t fg = GxEPD_BLACK;
 U8G2_FOR_ADAFRUIT_GFX u8g2Fonts;
@@ -76,7 +67,6 @@ String lastMessage = "";
 
 // State flags
 bool hasClient = false;
-
 
 // Wiring: 
 // Servo orange wires, base to 25, l1 to 26
@@ -103,32 +93,11 @@ bool hasClient = false;
 void ir_init();
 bool ir_read_frame();
 
-// Display
-void displayEyes(int emote, bool refreshScreen = false);
-void displayEyesSymbol(const char* symbol, bool refreshScreen = false);
-void displayText0(const char* inputText, bool refreshScreen = false);
-void displayServerState(bool displayOnScreen = false, bool refreshScreen = false);
-void displayTextAdv(const char* inputText, int fontSize = 4, uint16_t color = GxEPD_WHITE, int cX = 120, int cY = 80, bool refreshScreen = false);
-void setDisplayStandard();
-
 void blinkEvent(); // Not in use
-
-// Servos
-void servoTest();
-void servoReset();
-void setBaseServo (int angle);
-void setLinkOneServo (int angle);
 
 // Utilities
 float inverseLerp(float a, float b, float x);
 float lerp(float start_val, float end_val, float fraction);
-
-// Gestures
-void g_base();
-void g_yes();
-void g_no();
-void g_search();
-void g_full();
 
 // TCP / MIC
 void parseLastMessage();
@@ -155,10 +124,14 @@ void setup()
   display.init();
   u8g2Fonts.begin(display); // connect u8g2 procedures to Adafruit GFX
 
+  delay(100);
+
+  EyesInit(display, u8g2Fonts);
+  EyesSetColors(GxEPD_WHITE, GxEPD_BLACK);
+
   delay(500);
 
-  baseServo.attach(SERVO_BASE_PIN);
-  linkOneServo.attach(SERVO_LINK_1_PIN);
+  ServoInit();
 
   //pinMode(SLIDE_PIN, INPUT);
   //pinMode(ROT_PIN, INPUT);
@@ -184,7 +157,7 @@ void setup()
   Serial.print("W: "); Serial.println(display.width());
   Serial.print("H: "); Serial.println(display.height());
 
-  displayServerState();
+  displayServerState(false, true, hasClient, lastMessage);
   debug_network();
 
   server.begin(port);
@@ -206,14 +179,14 @@ void loop()
     hasClient = true;
     Serial.println("Client connected");
     activeClient.flush();
-    displayServerState();
+    displayServerState(false, true, hasClient, lastMessage);
   }
 
   if (hasClient && !activeClient.connected())
   {
     hasClient = false;
     activeClient.stop();
-    displayServerState();
+    displayServerState(false, true, hasClient, lastMessage);
   }
 
   bool btnHeld = digitalRead(BTN_PIN) == LOW;
@@ -260,38 +233,39 @@ void loop()
         break;
     }
     
-    if (recState == Idle) 
+    if (recState == Idle && activeClient.available() > 0) 
     {
-      if (activeClient.available() > 0) // Command incoming
-      {
-        String incoming = activeClient.readStringUntil('\n');
-        incoming.trim();
-        lastMessage = incoming;
+      String incoming = activeClient.readStringUntil('\n');
+      incoming.trim();
+      lastMessage = incoming;
 
-        Serial.println("---");
-        Serial.print("Data received: ");
-        Serial.print(lastMessage);
-        Serial.println();
+      Serial.println("---");
+      Serial.print("Data received: ");
+      Serial.print(lastMessage);
+      Serial.println();
 
-        displayServerState();
+      displayServerState(false, true, hasClient, lastMessage);
 
-        displayEyesSymbol("!", true);
-        delay(500);
-        
-        parseLastMessage();
-
-        displayEyes(0);
-      }
+      displayEyesSymbol("!", true);
+      delay(500);
       
-      // IR cam poll at ~66 Hz
-      if (millis() - ir_last_ms >= IR_PERIOD_MS) {
-        ir_last_ms = millis();
-        if (ir_read_frame()) {
-          // Optional: quick serial debug
-         // Serial.printf("IR: (%d,%d), (%d,%d), (%d,%d), (%d,%d)\n",
-            //IRx[0],IRy[0], IRx[1],IRy[1], IRx[2],IRy[2], IRx[3],IRy[3]);
+      parseLastMessage();
+
+      displayEyes(0);
+    }
+  }
+
+  if (recState == Idle) {
+    // IR cam poll at ~66 Hz
+    if (millis() - ir_last_ms >= IR_PERIOD_MS) {
+      ir_last_ms = millis();
+      if (ir_read_frame()) {
+        // Optional: quick serial debug
+        // Serial.printf("IR: (%d,%d), (%d,%d), (%d,%d), (%d,%d)\n",
+          //IRx[0],IRy[0], IRx[1],IRy[1], IRx[2],IRy[2], IRx[3],IRy[3]);
+          if (IRx[0] != 1023 || IRy[0] != 1023) {
             Serial.printf("IR: (%d,%d)\n", IRx[0],IRy[0]);
-        }
+          }
       }
     }
   }
@@ -309,8 +283,6 @@ void loop()
     baseServoC = m;
   }
   */
-
-  
 
   switch (recState)
   {
@@ -388,175 +360,6 @@ void processMic() {
   }
 }
 
-void displayEyes(int emote, bool refreshScreen) {
-  display.setRotation(3);
-  display.setPartialWindow(0, 0, display.width(), display.height());
-  display.firstPage();
-  do {
-    if (refreshScreen)
-    {
-      display.fillScreen(bg);
-    }
-
-    // Draw left eye
-    display.fillCircle(90, 60, 35, GxEPD_BLACK);
-
-    // Draw right eye
-    display.fillCircle(210, 60, 35, GxEPD_BLACK);
-
-    switch (emote) {
-      case -1: // No eyes
-        break;
-      case 0: // Standard
-        display.fillCircle(90, 65, 8, GxEPD_WHITE);
-        display.fillCircle(210, 65, 8, GxEPD_WHITE);
-        break;
-      case 2: // Wide
-        display.fillCircle(90, 65, 14, GxEPD_WHITE);
-        display.fillCircle(210, 65, 14, GxEPD_WHITE);
-        Serial.println("Showing wide");
-        break;
-      case 6: // Happy
-        display.fillCircle(90, 65, 14, GxEPD_WHITE);
-        display.fillCircle(210, 65, 14, GxEPD_WHITE);
-        display.fillCircle(90, 75, 14, GxEPD_BLACK);
-        display.fillCircle(210, 75, 14, GxEPD_BLACK);
-        Serial.println("Showing happy");
-        break;
-      case 7: // Sad
-        display.fillCircle(90, 65, 14, GxEPD_WHITE);
-        display.fillCircle(210, 65, 14, GxEPD_WHITE);
-        display.fillCircle(90, 55, 14, GxEPD_BLACK);
-        display.fillCircle(210, 55, 14, GxEPD_BLACK);
-        Serial.println("Showing sad");
-        break;
-    }
-    
-
-  } while (display.nextPage());
-}
-
-void displayEyesSymbol(const char* symbol, bool refreshScreen)
-{
-  display.setRotation(3);
-  display.setPartialWindow(0, 0, display.width(), display.height());
-  display.firstPage();
-  do {
-    if (refreshScreen)
-    {
-      display.fillScreen(bg);
-    }
-
-    // Draw left eye
-    display.fillCircle(90, 60, 35, GxEPD_BLACK);
-    // Draw right eye
-    display.fillCircle(210, 60, 35, GxEPD_BLACK);
-
-    display.setTextColor(GxEPD_WHITE); 
-    display.setTextSize(4);            
-    display.setCursor(80, 50);         
-    display.print(symbol);                
-
-    display.setCursor(200, 50);        
-    display.print(symbol);      
-    
-
-  } while (display.nextPage());
-}
-
-void setDisplayStandard() {
-  display.setRotation(3); // 0--> No rotation ,  1--> rotate 90 deg
-  u8g2Fonts.setFontMode(1);                 // use u8g2 transparent mode (this is default)
-  u8g2Fonts.setFontDirection(0);            // left to right (this is default)
-  u8g2Fonts.setForegroundColor(fg);         // apply Adafruit GFX color
-  u8g2Fonts.setBackgroundColor(bg);         // apply Adafruit GFX color
-}
-
-void displayText0(const char* inputText, bool refreshScreen) {
-  setDisplayStandard();
-  u8g2Fonts.setFont(u8g2_font_logisoso32_tr); //u8g2_font_logisoso32_tn--->numbers only to save memory ; u8g2_font_logisoso32_tr , u8g2_font_logisoso32_tf -->numbers&letters
-  uint16_t x = 165;
-  uint16_t y = 75;
-  display.setPartialWindow(0, 0, display.width(), 296); //this sets a window for the partial update, so the values can update without refreshing the entire screen.
-  display.firstPage();
-  do
-  {
-    if (refreshScreen)
-    {
-      display.fillScreen(bg);
-    }
-
-    u8g2Fonts.setCursor(10, y); 
-    u8g2Fonts.print(inputText);
-  }
-  while (display.nextPage());
-}
-
-void displayTextAdv(const char* inputText, int fontSize, uint16_t color, int cX, int cY, bool refreshScreen)
-{
-  display.setRotation(3);
-  display.setPartialWindow(0, 0, display.width(), display.height());
-  display.firstPage();
-  do {
-    if (refreshScreen)
-    {
-      display.fillScreen(bg);
-    }
-
-    display.setTextColor(color); 
-    display.setTextSize(fontSize);            
-    display.setCursor(cX, cY);         
-    display.print(inputText);                 
-
-  } while (display.nextPage());
-}
-
-void displayServerState(bool displayOnScreen, bool refreshScreen) {
-  Serial.println("---");
-  Serial.println("Server State");
-  Serial.print("IP: ");
-  Serial.println(WiFi.localIP());
-  Serial.print("Connected: ");
-  Serial.println(hasClient ? "True" : "False");
-  Serial.print("Last: ");
-  Serial.println(lastMessage);
-
-  if (!displayOnScreen)
-  {
-    return;
-  }
-  
-  u8g2Fonts.setFont(u8g2_font_t0_16_tf);
-  uint16_t x = 40;
-  uint16_t y = 25;
-  display.setPartialWindow(0, 0, display.width(), 296); //this sets a window for the partial update, so the values can update without refreshing the entire screen.
-  display.firstPage();
-  do
-  {
-    if (refreshScreen)
-    {
-      display.fillScreen(bg);
-    }
-    
-    u8g2Fonts.setCursor(x, y); 
-    u8g2Fonts.print("IP:");
-    u8g2Fonts.setCursor(x + 100, y); 
-    u8g2Fonts.print(WiFi.localIP().toString().c_str());
-
-    u8g2Fonts.setCursor(x, y + 25);
-    u8g2Fonts.print("Connected:");
-    u8g2Fonts.setCursor(x + 100, y + 25);
-    u8g2Fonts.print(hasClient ? "True" : "False");
-
-    u8g2Fonts.setCursor(x, y + 75);
-    u8g2Fonts.print("Last:");
-    u8g2Fonts.setCursor(x + 100, y + 75);
-    u8g2Fonts.print(lastMessage);
-
-  }
-  while (display.nextPage());
-}
-
 void blinkEvent() {
     std::map<int,int> rMap;
     rMap[0] = 0;
@@ -573,45 +376,6 @@ void blinkEvent() {
     displayEyes(-1);
     delay(250);
     displayEyes(0);
-}
-
-void servoTest() {
-  displayEyesSymbol("8");
-  for(int angle = 0; angle <= 180; angle++) {
-    setBaseServo(angle);
-    setLinkOneServo(angle);
-    delay(15); // Small delay for smoother movement
-  }
-
-  delay(1000); // Pause for a second at the end
-
-  // Rotate all servos back from 180 to 0 degrees
-  for(int angle = 180; angle >= 0; angle--) {
-    setBaseServo(angle);
-    setLinkOneServo(angle);
-    delay(15); // Small delay for smoother movement
-  }
-
-  delay(1000); // Pause for a second at the end
-}
-
-void servoReset() {
-  setBaseServo(90);
-  setLinkOneServo(90);
-}
-
-void setBaseServo (int angle) {
-  angle = max(0, angle);
-  angle = min(angle, 180);
-  baseServo.write(angle);
-  baseServoC = angle;
-}
-
-void setLinkOneServo (int angle) {
-  angle = max(0, angle);
-  angle = min(angle, 180);
-  linkOneServo.write(angle);
-  linkOneServoC = angle;
 }
 
 void parseLastMessage() {
@@ -631,7 +395,7 @@ void parseLastMessage() {
     }
     else if (lastMessage == "dbcon") // debug connection
     {
-      displayServerState(true, true);
+      displayServerState(false, true, hasClient, lastMessage);
       delay(100);
     }
     else if (lastMessage == "dbtxt") // debug sub text
@@ -670,75 +434,6 @@ void parseLastMessage() {
       displayEyesSymbol("?");
       delay(500);
     }
-}
-
-void g_base() {
-  displayEyes(0);
-  setBaseServo(90);
-  setLinkOneServo(110);
-}
-
-void g_yes() {
-  displayEyes(6, true);
-  delay(200);
-  setLinkOneServo(linkOneServoC - 25);
-  delay(300);
-  setLinkOneServo(linkOneServoC + 50);
-  delay(300);
-  setLinkOneServo(linkOneServoC - 50);
-  delay(300);
-  setLinkOneServo(linkOneServoC + 50);
-  delay(300);
-  setLinkOneServo(linkOneServoC - 25);
-  displayEyes(0, true);
-}
-
-void g_no() {
-  displayEyes(7, true);
-  delay(200);
-  setBaseServo(baseServoC - 25);
-  delay(300);
-  setBaseServo(baseServoC + 50);
-  delay(300);
-  setBaseServo(baseServoC - 50);
-  delay(300);
-  setBaseServo(baseServoC + 50);
-  delay(300);
-  setBaseServo(baseServoC - 25);
-  displayEyes(0, true);
-}
-
-void g_search() {
-  displayEyesSymbol("?", true);
-  delay(200);
-  setBaseServo(90);
-  setLinkOneServo(90);
-  for (int i = 90; i > 60; i -= 5)
-  {
-    setLinkOneServo(i);
-    delay(100);
-  }
-  for (int i = 90; i < 140; i += 5) {
-    setBaseServo(i);
-    delay(100);
-  }
-  for (int i = 140; i > 50; i -= 5) {
-    setBaseServo(i);
-    delay(100);
-  }
-  delay(300);
-  setBaseServo(90);
-  delay(100);
-  g_base();
-  displayEyes(0, true);
-}
-
-void g_full() 
-{
-  g_base();
-  g_yes();
-  g_no();
-  g_search();
 }
 
 // Helpers
