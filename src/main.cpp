@@ -25,7 +25,7 @@ int linkOneServoC;
 #define I2S_DMA_BUF_LEN  256
 #define I2S_DMA_BUF_CNT  6
 
-#define BTN_PIN 22
+#define BTN_PIN 32
 #define BTN_THRESHOLD    1000
 
 #define MIC_PIN 34
@@ -35,6 +35,13 @@ RecState recState = Idle;
 
 bool readingMic = false;
 int micDelay = 5;
+
+// IR
+#define IR_ADDR 0x58   // 7-bit address
+static uint8_t ir_buf[16];
+static int16_t IRx[4], IRy[4];
+static uint32_t ir_last_ms = 0;
+static const uint16_t IR_PERIOD_MS = 500; // 15 = ~66 Hz
 
 // Other peripherals
 #define SLIDE_PIN 0 // TODO SET PIN
@@ -73,15 +80,28 @@ bool hasClient = false;
 
 // Wiring: 
 // Servo orange wires, base to 25, l1 to 26
-// battery to pos/neg
-// servos to pos/neg
-// esp32 ground to neg
+// battery power -> rail 2
 // esp32 power via usb
-// eink to pos/neg
+// esp32 3.3, gnd -> rail 1
+// esp32 gnd -> rail 2
+// rail 1 gnd -> rail 2 gnd
+
+// eink rail 1
 // eink y18 o5 g17 w16 p4 b23
 // y->p are in order, b23 is the outlier at the far end
 
-// Mic signal to 34
+// Mic -> rail 1
+// Mic -> 34
+
+// Button -> rail 1
+// Button -> 32
+
+// IR -> rail 1
+// SDA -> 21
+// SCL -> 22
+
+void ir_init();
+bool ir_read_frame();
 
 // Display
 void displayEyes(int emote, bool refreshScreen = false);
@@ -171,6 +191,8 @@ void setup()
 
   setupMic();
 
+  ir_init();
+
   displayEyes(0);
   delay(500);
 }
@@ -227,6 +249,9 @@ void loop()
             activeClient.println("MIC_STREAM_END");
             activeClient.flush();
           }
+          else {
+            Serial.println("Lost client, ending stream");
+          }
           recState = Idle;
         }
         else {
@@ -235,25 +260,39 @@ void loop()
         break;
     }
     
-    if (recState == Idle && activeClient.available() > 0) // Command incoming
+    if (recState == Idle) 
     {
-      String incoming = activeClient.readStringUntil('\n');
-      incoming.trim();
-      lastMessage = incoming;
+      if (activeClient.available() > 0) // Command incoming
+      {
+        String incoming = activeClient.readStringUntil('\n');
+        incoming.trim();
+        lastMessage = incoming;
 
-      Serial.println("---");
-      Serial.print("Data received: ");
-      Serial.print(lastMessage);
-      Serial.println();
+        Serial.println("---");
+        Serial.print("Data received: ");
+        Serial.print(lastMessage);
+        Serial.println();
 
-      displayServerState();
+        displayServerState();
 
-      displayEyesSymbol("!", true);
-      delay(500);
+        displayEyesSymbol("!", true);
+        delay(500);
+        
+        parseLastMessage();
+
+        displayEyes(0);
+      }
       
-      parseLastMessage();
-
-      displayEyes(0);
+      // IR cam poll at ~66 Hz
+      if (millis() - ir_last_ms >= IR_PERIOD_MS) {
+        ir_last_ms = millis();
+        if (ir_read_frame()) {
+          // Optional: quick serial debug
+         // Serial.printf("IR: (%d,%d), (%d,%d), (%d,%d), (%d,%d)\n",
+            //IRx[0],IRy[0], IRx[1],IRy[1], IRx[2],IRy[2], IRx[3],IRy[3]);
+            Serial.printf("IR: (%d,%d)\n", IRx[0],IRy[0]);
+        }
+      }
     }
   }
 
@@ -270,6 +309,8 @@ void loop()
     baseServoC = m;
   }
   */
+
+  
 
   switch (recState)
   {
@@ -698,6 +739,63 @@ void g_full()
   g_yes();
   g_no();
   g_search();
+}
+
+// Helpers
+void ir_write2(uint8_t a, uint8_t b) {
+  Wire.beginTransmission(IR_ADDR);
+  Wire.write(a);
+  Wire.write(b);
+  Wire.endTransmission();
+}
+
+void ir_init() {
+  Wire.begin();
+  Wire.setClock(100000);
+  delay(5);
+
+  // Init sequence from DFRobot example
+  ir_write2(0x30, 0x01); delay(10);
+  ir_write2(0x30, 0x08); delay(10);
+  ir_write2(0x06, 0x90); delay(10);
+  ir_write2(0x08, 0xC0); delay(10);
+  ir_write2(0x1A, 0x40); delay(10);
+  ir_write2(0x33, 0x33); delay(100);
+
+  // Quick probe
+  Wire.beginTransmission(IR_ADDR);
+  uint8_t err = Wire.endTransmission();
+  Serial.printf("IR cam init: %s\n", err == 0 ? "OK" : "NOT FOUND");
+}
+
+// read one frame; returns true if 4 points parsed
+bool ir_read_frame() {
+  // request data starting at 0x36
+  Wire.beginTransmission(IR_ADDR);
+  Wire.write(0x36);
+  Wire.endTransmission(true);
+  uint8_t n = Wire.requestFrom(IR_ADDR, 16, true);
+  for (int i = 0; i < 16; i++){
+    ir_buf[i] = 0;
+  }
+
+  int count = 0;
+  while (Wire.available() && count < 16) {
+    ir_buf[count] = Wire.read();
+    count++;
+  }
+
+  // Decode 4 points: x = buf[1|4|7|10] + ((buf[3|6|9|12]&0x30)<<4)
+  //                  y = buf[2|5|8|11] + ((buf[3|6|9|12]&0xC0)<<2)
+  const uint8_t idx[4][3] = {{1,2,3},{4,5,6},{7,8,9},{10,11,12}};
+  for (int i=0;i<4;i++) {
+    uint8_t lx = ir_buf[idx[i][0]];
+    uint8_t ly = ir_buf[idx[i][1]];
+    uint8_t s  = ir_buf[idx[i][2]];
+    IRx[i] = (int16_t)lx + ((int16_t)(s & 0x30) << 4);
+    IRy[i] = (int16_t)ly + ((int16_t)(s & 0xC0) << 2);
+  }
+  return true;
 }
 
 float inverseLerp(float a, float b, float x) {
