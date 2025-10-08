@@ -6,8 +6,11 @@
 #include <vector>
 #include <Wire.h>
 
+// Internal
 #include "Eyes.h"
 #include "Motors.h"
+#include "Beacon.h"
+#include "HomeNet.h"
 
 // Mic
 #define I2S_PORT         I2S_NUM_0
@@ -65,6 +68,8 @@ WiFiServer server(port);
 WiFiClient activeClient;
 String lastMessage = "";
 
+String homeIncoming;
+
 // State flags
 bool hasClient = false;
 
@@ -92,8 +97,6 @@ bool hasClient = false;
 
 void ir_init();
 bool ir_read_frame();
-
-void blinkEvent(); // Not in use
 
 // Utilities
 float inverseLerp(float a, float b, float x);
@@ -157,8 +160,17 @@ void setup()
   Serial.print("W: "); Serial.println(display.width());
   Serial.print("H: "); Serial.println(display.height());
 
-  displayServerState(false, true, hasClient, lastMessage);
   debug_network();
+
+  startBeacon();
+  IPAddress f_server;
+  uint16_t f_port;
+  waitForBeacon(f_server, f_port);
+
+  connectToHome(f_server, f_port);
+  register_device_arm();
+
+  displayServerState(false, true, hasClient, lastMessage);
 
   server.begin(port);
 
@@ -225,6 +237,7 @@ void loop()
           else {
             Serial.println("Lost client, ending stream");
           }
+          sendHomePacket("ARM MIC");
           recState = Idle;
         }
         else {
@@ -268,6 +281,11 @@ void loop()
           }
       }
     }
+
+    if (checkForHomeIncoming(homeIncoming)) {
+      Serial.print("Home incoming: ");
+      Serial.println(homeIncoming);
+    }
   }
 
   /*
@@ -290,7 +308,7 @@ void loop()
       delay(100);
       break;
     case Recording:
-      delay(10);
+      delay(10); // short cycle when recording so the buffer is not too full
       break;
   }
 }
@@ -358,24 +376,6 @@ void processMic() {
       lastFlushMs = now;
     }
   }
-}
-
-void blinkEvent() {
-    std::map<int,int> rMap;
-    rMap[0] = 0;
-    rMap[1] = 1;
-    rMap[2] = 2;
-    rMap[3] = 6;
-    rMap[4] = 7;
-
-    displayEyes(-1);
-    delay(250);
-    int r = random(0,4);
-    displayEyes(rMap[r]);
-    delay(750);
-    displayEyes(-1);
-    delay(250);
-    displayEyes(0);
 }
 
 void parseLastMessage() {
